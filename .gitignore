@@ -1,4 +1,18 @@
 /venv
 .vscode
 .env
-__pycache__ 
+__pycache__
+*.pyc
+
+# local state
+.cache.db*
+.runs.db*
+.uploads/
+out/
+
+# generated output
+leads_*.csv
+results_*.csv
+.claude
+*.xlsx
+*.csv

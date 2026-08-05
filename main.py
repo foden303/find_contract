@@ -1,149 +1,210 @@
 #!/usr/bin/env python3
 import argparse
+import asyncio
+import csv
 import json
 import os
 import sys
+import time
 from dataclasses import asdict
 
-from config import Config, DEFAULT_MAX_THREADS_COMPANIES
-from models import Result
-from utils import is_domain_like
-from scraper import scan_company
-from search_engine import discover_trade_leads, process_batch
-import csv
+from core.cache import Cache
+from core.config import DEFAULT_MAX_PAGES, DEFAULT_MAX_THREADS_COMPANIES, Config
+from core.models import Result
+from core.pipeline import discover_trade_leads, process_batch
+from core.tabular import build_jobs, load_table
 
-def load_companies_from_csv(
-    path: str, 
-    company_col: str, 
-    country_col: str | None = None, 
-    product_col: str | None = None
-) -> list[tuple[str, str | None, list[str]]]:
-    rows = []
-    if not os.path.exists(path):
-        print(f"[!] File not found: {path}")
-        return []
+TABLE_EXTS = (".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls")
 
-    with open(path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            company = row.get(company_col)
-            if not company:
-                continue
-            
-            country = row.get(country_col) if country_col else None
-            
-            product_raw = row.get(product_col) if product_col else None
-            products = [p.strip() for p in product_raw.split(",")] if product_raw else []
-            
-            rows.append((company, country, products))
-    return rows
+CSV_FIELDS = [
+    "query", "company", "country", "products", "website", "confidence",
+    "match_reason", "priority_emails", "emails", "guessed_emails",
+    "phones", "whatsapp_numbers", "whatsapp_links", "social_links",
+    "pages_scanned", "alternates", "elapsed_sec", "notes",
+]
+
 
 def parse_args(argv: list[str]):
-    parser = argparse.ArgumentParser(description="Global B2B Contact Finder")
-    parser.add_argument("input_value", help="Company Name, Domain, or CSV file path")
-    parser.add_argument("--keyword", action="store_true", help="Discovery mode using keywords")
-    parser.add_argument("--country", help="Filter by country")
-    parser.add_argument("--product", help="Filter by product (comma-separated for multiple)")
-    parser.add_argument("--limit", type=int, default=10, help="Max outcomes for discovery")
-    parser.add_argument("--threads", type=int, default=DEFAULT_MAX_THREADS_COMPANIES, help="Max parallel threads")
-    parser.add_argument("--max-pages", type=int, default=5, help="Max sub-pages to scan per company")
-    parser.add_argument("--top-results", type=int, default=1, help="Max search results to scan per company")
-    parser.add_argument("--delay", type=float, default=0.5, help="Seconds between requests")
-    parser.add_argument("--out", help="Output CSV file path")
-    parser.add_argument("--json", action="store_true", help="Output as JSON")
-    parser.add_argument("--csv-column", default="company", help="Column name for company/domain")
-    parser.add_argument("--country-column", default="country", help="Column name for country")
-    parser.add_argument("--product-column", default="product", help="Column name for product")
-    return parser.parse_args(argv)
+    p = argparse.ArgumentParser(description="Global B2B Contact Finder")
+    p.add_argument("input_value", help="Company name, domain, or path to a .csv/.xlsx file")
+    p.add_argument("--keyword", action="store_true", help="Discovery mode using product keywords")
+    p.add_argument("--country", help="Country of the target companies")
+    p.add_argument("--product", help="Product filter (comma-separated)")
+    p.add_argument("--limit", type=int, default=10, help="Max leads in discovery mode")
+    p.add_argument("--threads", type=int, default=DEFAULT_MAX_THREADS_COMPANIES,
+                   help="Companies scanned concurrently")
+    p.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES,
+                   help="Max sub-pages to scan per site")
+    p.add_argument("--top-results", type=int, default=3,
+                   help="Max search candidates to scan per company")
+    p.add_argument("--delay", type=float, default=0.0,
+                   help="Minimum seconds between requests to the same host")
+    p.add_argument("--min-score", type=float, default=30.0,
+                   help="Minimum relevance score (0-100) for a candidate to be scanned")
+    p.add_argument("--no-cache", action="store_true", help="Bypass the local SQLite cache")
+    p.add_argument("--insecure-tls", action="store_true",
+                   help="Skip TLS verification (only behind a TLS-inspecting proxy)")
+    p.add_argument("--no-guess", action="store_true", help="Do not generate info@/sales@ fallbacks")
+    p.add_argument("--no-early-exit", action="store_true",
+                   help="Scan every page even after contacts are found")
+    p.add_argument("--out", help="Output CSV file path")
+    p.add_argument("--json", action="store_true", help="Print results as JSON")
+    p.add_argument("--sheet", help="Worksheet name (Excel files with several sheets)")
+    p.add_argument("--no-dedupe", action="store_true",
+                   help="Keep one job per row instead of one per unique company")
+    p.add_argument("--limit-rows", action="store_true",
+                   help="Apply --limit to spreadsheet batches too")
+    p.add_argument("--csv-column", default="company", help="Column holding the company/domain")
+    p.add_argument("--country-column", default="country", help="Column holding the country")
+    p.add_argument("--product-column", default="product", help="Column holding the product")
+    return p.parse_args(argv)
+
 
 def write_csv(results: list[Result], out_path: str) -> None:
-    fieldnames = [
-        "query", "company", "country", "products", "website",
-        "priority_emails", "emails", "hunter_emails", "phones",
-        "whatsapp_numbers", "whatsapp_verified", "whatsapp_links",
-        "social_links", "pages_scanned", "notes",
-    ]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
         for r in results:
             writer.writerow({
                 "query": r.query,
-                "company": r.company,
+                "company": r.company or "",
                 "country": r.country or "",
                 "products": ", ".join(r.products),
                 "website": r.website or "",
+                "confidence": f"{r.confidence:.1f}",
+                "match_reason": "; ".join(r.match_reason),
                 "priority_emails": " | ".join(r.priority_emails),
                 "emails": " | ".join(r.emails),
-                "hunter_emails": " | ".join(r.hunter_emails),
+                "guessed_emails": " | ".join(r.guessed_emails),
                 "phones": " | ".join(r.phones),
                 "whatsapp_numbers": " | ".join(r.whatsapp_numbers),
-                "whatsapp_verified": " | ".join(r.whatsapp_verified),
                 "whatsapp_links": " | ".join(r.whatsapp_links),
                 "social_links": " | ".join(r.social_links),
                 "pages_scanned": " | ".join(r.pages_scanned),
+                "alternates": " | ".join(r.alternates),
+                "elapsed_sec": f"{r.elapsed:.1f}",
                 "notes": " | ".join(r.notes),
             })
 
-def main(argv: list[str]) -> int:
-    args = parse_args(argv)
-    
-    # Parse products if provided in CLI
-    cli_products = [p.strip() for p in args.product.split(",")] if args.product else []
-    
+
+def print_human(res: Result) -> None:
+    bar = "=" * 60
+    print(f"\n{bar}")
+    print(f"COMPANY   : {res.company or '???'}")
+    print(f"COUNTRY   : {res.country or '-'}")
+    if res.products:
+        print(f"PRODUCTS  : {', '.join(res.products)}")
+    print(f"WEBSITE   : {res.website or 'Not found'}")
+    print(f"CONFIDENCE: {res.confidence:.0f}/100"
+          + (f"  ({'; '.join(res.match_reason)})" if res.match_reason else ""))
+    print("-" * 60)
+    if res.priority_emails:
+        print(f"KEY EMAILS: {', '.join(res.priority_emails)}")
+    if res.emails:
+        print(f"EMAILS    : {', '.join(res.emails)}")
+    if res.guessed_emails:
+        print(f"GUESSED   : {', '.join(res.guessed_emails)}  (MX verified, not confirmed)")
+    if res.phones:
+        print(f"PHONES    : {', '.join(res.phones)}")
+    if res.whatsapp_numbers:
+        print(f"WHATSAPP  : {', '.join(res.whatsapp_numbers)}")
+    if res.social_links:
+        print(f"SOCIAL    : {', '.join(res.social_links[:5])}")
+    if not res.has_contact and not res.guessed_emails:
+        print("No contact details found.")
+    print(f"PAGES     : {len(res.pages_scanned)} scanned in {res.elapsed:.1f}s")
+    print(bar)
+
+
+async def run(args) -> list[Result]:
     config = Config(
         max_threads_companies=args.threads,
         max_pages=args.max_pages,
         delay=args.delay,
-        json_out=args.json
+        top_results=args.top_results,
+        min_score=args.min_score,
+        use_cache=not args.no_cache,
+        insecure_tls=args.insecure_tls,
+        guess_emails=not args.no_guess,
+        early_exit=not args.no_early_exit,
+        json_out=args.json,
     )
-    
-    results: list[Result] = []
+    cache = Cache(config.cache_path, config.cache_ttl, config.use_cache)
+    cli_products = [p.strip() for p in args.product.split(",") if p.strip()] if args.product else []
 
-    # 1. Discovery Mode (--keyword)
+    def on_event(event: dict) -> None:
+        if args.json or event.get("type") != "progress":
+            return
+        r = event["result"]
+        contacts = len(r.priority_emails) + len(r.emails)
+        print(f"[{event['done']}/{event['total']}] {r.company or r.query} "
+              f"-> conf {r.confidence:.0f}, {contacts} emails, {len(r.phones)} phones "
+              f"({r.elapsed:.1f}s)")
+
+    # 1. Discovery mode
     if args.keyword:
-        print(f"[*] Discovering companies for: '{args.input_value}' in {args.country or 'Global'}...")
-        leads = discover_trade_leads(args.input_value, region=args.country or "", limit=args.limit)
-        print(f"[*] Found {len(leads)} potential companies. Starting contact extraction...")
-        
-        rows = [(name, args.country, cli_products) for name, url, snippet in leads]
-        results = process_batch(rows, config, top_results=args.top_results)
-
-    # 2. Batch CSV Mode
-    elif os.path.isfile(args.input_value) and args.input_value.lower().endswith(".csv"):
-        rows = load_companies_from_csv(
-            args.input_value,
-            company_col=args.csv_column,
-            country_col=args.country_column,
-            product_col=args.product_column,
-        )
-        results = process_batch(rows, config, top_results=args.top_results)
-
-    # 3. Single Mode
-    else:
-        result = scan_company(
-            args.input_value,
-            country=args.country,
-            products=cli_products,
-            max_pages=config.max_pages,
-            delay=config.delay,
-            top_results=args.top_results
-        )
-        results.append(result)
-        from search_engine import print_human
         if not args.json:
-            print_human(result)
+            print(f"[*] Discovering companies for '{args.input_value}' "
+                  f"in {args.country or 'Global'}...")
+        leads = await discover_trade_leads(
+            args.input_value, config, region=args.country or "", limit=args.limit, cache=cache
+        )
+        if not args.json:
+            print(f"[*] {len(leads)} candidate companies found. Extracting contacts...")
+        rows = [(lead.title or lead.url, args.country, cli_products) for lead in leads]
+        return await process_batch(rows, config, on_event=on_event, cache=cache)
 
-    # Output Handling
+    # 2. Batch mode from a spreadsheet or CSV
+    if args.input_value.lower().endswith(TABLE_EXTS):
+        if not os.path.isfile(args.input_value):
+            # Without this the missing path falls through to single mode and
+            # we search the web for the literal string "companies.csv".
+            raise SystemExit(f"[!] File not found: {args.input_value}")
+
+        headers, table, _, sheet = load_table(args.input_value, args.sheet)
+        jobs = build_jobs(
+            headers, table,
+            company_col=args.csv_column,
+            country_col=args.country_column if args.country_column in headers else None,
+            product_col=args.product_column if args.product_column in headers else None,
+            dedupe=not args.no_dedupe,
+            limit=args.limit if args.limit_rows else None,
+            product_override=cli_products,
+        )
+        if not args.json:
+            print(f"[*] {sheet}: {len(table)} rows -> {len(jobs)} companies to scan...")
+        rows = [j.as_row() for j in jobs]
+        return await process_batch(rows, config, on_event=on_event, cache=cache)
+
+    # 3. Single company / domain
+    results = await process_batch(
+        [(args.input_value, args.country, cli_products)], config, cache=cache
+    )
+    if not args.json:
+        for r in results:
+            print_human(r)
+    return results
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    started = time.perf_counter()
+    results = asyncio.run(run(args))
+    elapsed = time.perf_counter() - started
+
     if args.json:
-        out_json = [asdict(r) for r in results]
-        print(json.dumps(out_json, ensure_ascii=False, indent=2))
+        print(json.dumps([asdict(r) for r in results], ensure_ascii=False, indent=2))
+    else:
+        with_contact = sum(1 for r in results if r.has_contact)
+        print(f"\n[+] {with_contact}/{len(results)} companies with contacts "
+              f"in {elapsed:.1f}s")
 
     if args.out:
         write_csv(results, args.out)
-        print(f"\n[+] SUCCESS: Results saved to {args.out}")
+        print(f"[+] Saved to {args.out}")
 
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))

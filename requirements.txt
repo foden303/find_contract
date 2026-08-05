@@ -1,4 +1,13 @@
-requests
+httpx[http2]
+selectolax
 beautifulsoup4
 lxml
 ddgs
+openpyxl
+phonenumbers
+rapidfuzz
+tldextract
+dnspython
+fastapi
+uvicorn[standard]
+python-multipart

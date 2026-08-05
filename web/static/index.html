@@ -1,0 +1,690 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B2B Contact Finder</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --ink: #16181d; --muted: #6b7280;
+    --line: #e3e6ea; --accent: #2563eb; --accent-ink: #fff;
+    --ok: #15803d; --warn: #b45309; --bad: #b91c1c; --chip: #eef2f7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --panel: #1c1f25; --ink: #e8eaed; --muted: #9aa3af;
+      --line: #2c313a; --accent: #4f86f7; --chip: #262b33;
+      --ok: #4ade80; --warn: #fbbf24; --bad: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+    background: var(--panel); display: flex; align-items: baseline; gap: 12px;
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+  main { max-width: 1400px; margin: 0 auto; padding: 20px; }
+  section {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 16px;
+  }
+  section[hidden] { display: none; }
+  h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); margin: 0 0 14px; font-weight: 650;
+  }
+  h2 .step {
+    display: inline-block; width: 20px; height: 20px; line-height: 20px;
+    text-align: center; border-radius: 50%; background: var(--accent);
+    color: var(--accent-ink); margin-right: 8px; font-size: 11px;
+  }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  select, input[type=text], input[type=number] {
+    width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--bg); color: var(--ink); font: inherit; font-size: 13px;
+  }
+  .grid { display: grid; gap: 12px; }
+  .g3 { grid-template-columns: repeat(3, 1fr); }
+  .g4 { grid-template-columns: repeat(4, 1fr); }
+  .g6 { grid-template-columns: repeat(6, 1fr); }
+  @media (max-width: 900px) { .g3, .g4, .g6 { grid-template-columns: 1fr 1fr; } }
+  button {
+    font: inherit; font-size: 13px; padding: 8px 16px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .lang { display: flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+  .lang button { border: 0; border-radius: 0; padding: 6px 12px; font-size: 12px; }
+  .lang button.on { background: var(--accent); color: var(--accent-ink); }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .drop {
+    border: 2px dashed var(--line); border-radius: 10px; padding: 30px;
+    text-align: center; color: var(--muted); cursor: pointer;
+  }
+  .drop.over { border-color: var(--accent); color: var(--accent); }
+  .tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th, td { padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--line);
+           white-space: nowrap; }
+  th { background: var(--chip); font-weight: 600; position: sticky; top: 0; }
+  th.sortable { cursor: pointer; user-select: none; }
+  tbody tr:hover { background: var(--chip); }
+  td.wrap { white-space: normal; max-width: 320px; }
+  .chip {
+    display: inline-block; padding: 1px 7px; border-radius: 20px;
+    background: var(--chip); font-size: 11px; color: var(--muted);
+  }
+  .conf { font-weight: 650; }
+  .conf.hi { color: var(--ok); } .conf.mid { color: var(--warn); } .conf.lo { color: var(--bad); }
+  .bar { height: 6px; background: var(--chip); border-radius: 4px; overflow: hidden; margin: 8px 0; }
+  .bar > i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .25s; }
+  .muted { color: var(--muted); }
+  .stat { font-size: 22px; font-weight: 650; }
+  .err { color: var(--bad); font-size: 13px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  a { color: var(--accent); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .inline { display: flex; gap: 6px; align-items: center; margin: 0; color: var(--ink); }
+</style>
+</head>
+<body>
+<header>
+  <h1 data-i18n="app.title">B2B Contact Finder</h1>
+  <span class="sub" data-i18n="app.sub">runs locally · 127.0.0.1</span>
+  <span class="spacer"></span>
+  <div class="lang">
+    <button id="lang-en" data-lang="en">EN</button>
+    <button id="lang-vi" data-lang="vi">VI</button>
+  </div>
+  <button id="btn-history" data-i18n="nav.history">History</button>
+</header>
+
+<main>
+  <!-- 1. FILE -->
+  <section id="s-file">
+    <h2><span class="step">1</span><span data-i18n="s1.title">Choose a raw data file</span></h2>
+    <div class="drop" id="drop">
+      <strong data-i18n="s1.drop">Drag a file here</strong>
+      <span data-i18n="s1.or"> or click to browse</span><br>
+      <span class="muted" data-i18n="s1.types">.xlsx · .xlsm · .csv — up to 64 MB</span>
+    </div>
+    <input type="file" id="file" accept=".xlsx,.xlsm,.csv,.tsv,.txt" hidden>
+    <div id="file-info" class="row" style="margin-top:10px" hidden></div>
+    <div id="file-err" class="err" style="margin-top:8px"></div>
+  </section>
+
+  <!-- 2. COLUMNS -->
+  <section id="s-cols" hidden>
+    <h2><span class="step">2</span><span data-i18n="s2.title">Pick the columns to look up</span></h2>
+    <div class="grid g4">
+      <div id="sheet-wrap" hidden>
+        <label data-i18n="s2.sheet">Sheet</label>
+        <select id="sheet"></select>
+      </div>
+      <div>
+        <label><span data-i18n="s2.company">Company name column</span>
+          <span style="color:var(--bad)">*</span></label>
+        <select id="col-company"></select>
+      </div>
+      <div>
+        <label data-i18n="s2.country">Country column</label>
+        <select id="col-country"></select>
+      </div>
+      <div>
+        <label data-i18n="s2.product">Product column</label>
+        <select id="col-product"></select>
+      </div>
+    </div>
+
+    <div class="grid g3" style="margin-top:12px">
+      <div>
+        <label data-i18n="s2.override">Shared product keywords (overrides the column, comma separated)</label>
+        <input type="text" id="override" data-i18n-ph="s2.override.ph"
+               placeholder="e.g. cinnamon, cassia, star anise">
+      </div>
+      <div>
+        <label data-i18n="s2.limit">Limit number of companies (blank = all)</label>
+        <input type="number" id="limit" min="1" data-i18n-ph="s2.limit.ph" placeholder="e.g. 50">
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <div class="row">
+          <label class="inline">
+            <input type="checkbox" id="dedupe" checked>
+            <span data-i18n="s2.dedupe">Merge duplicate companies</span>
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <p class="muted" style="margin:12px 0 6px;font-size:12px" data-i18n="s2.preview">Data preview:</p>
+    <div class="tablewrap" style="max-height:220px;overflow-y:auto">
+      <table id="preview"></table>
+    </div>
+
+    <details style="margin-top:14px">
+      <summary data-i18n="s2.advanced">Advanced options</summary>
+      <div class="grid g6" style="margin-top:10px">
+        <div><label data-i18n="adv.threads">Parallel workers</label>
+          <input type="number" id="threads" value="8" min="1" max="20"></div>
+        <div><label data-i18n="adv.pages">Pages per site</label>
+          <input type="number" id="maxpages" value="10" min="1" max="30"></div>
+        <div><label data-i18n="adv.candidates">Candidates per company</label>
+          <input type="number" id="topres" value="3" min="1" max="8"></div>
+        <div><label data-i18n="adv.minscore">Minimum score</label>
+          <input type="number" id="minscore" value="30" min="0" max="100"></div>
+        <div><label data-i18n="adv.delay">Delay (seconds)</label>
+          <input type="number" id="delay" value="0" min="0" step="0.1"></div>
+        <div>
+          <label data-i18n="adv.other">Other</label>
+          <div style="font-size:12px">
+            <label class="inline"><input type="checkbox" id="usecache" checked>
+              <span data-i18n="adv.cache">Cache</span></label>
+            <label class="inline"><input type="checkbox" id="guess" checked>
+              <span data-i18n="adv.guess">Guess emails</span></label>
+            <label class="inline" data-i18n-title="adv.tls.hint"
+                   title="Only enable behind a TLS-inspecting proxy">
+              <input type="checkbox" id="insecure">
+              <span data-i18n="adv.tls">Skip TLS check</span></label>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <div class="row" style="margin-top:16px">
+      <button class="primary" id="btn-run" disabled data-i18n="s2.run">Start searching</button>
+      <span id="plan-info" class="muted"></span>
+    </div>
+  </section>
+
+  <!-- 3. RESULTS -->
+  <section id="s-run" hidden>
+    <h2><span class="step">3</span><span data-i18n="s3.title">Results</span></h2>
+    <div class="row" style="margin-bottom:4px">
+      <div><div class="stat" id="st-done">0</div>
+        <span class="muted" data-i18n="s3.scanned">scanned</span></div>
+      <div><div class="stat" id="st-hit">0</div>
+        <span class="muted" data-i18n="s3.withcontact">with contacts</span></div>
+      <div><div class="stat" id="st-mail">0</div>
+        <span class="muted" data-i18n="s3.emails">emails</span></div>
+      <div><div class="stat" id="st-time">0s</div>
+        <span class="muted" data-i18n="s3.elapsed">elapsed</span></div>
+      <span class="spacer" style="flex:1"></span>
+      <button id="btn-cancel" data-i18n="s3.stop">Stop</button>
+      <button id="btn-csv" data-i18n="s3.csv">Download CSV</button>
+      <button id="btn-xlsx" data-i18n="s3.xlsx">Download Excel</button>
+    </div>
+    <div class="bar"><i id="bar"></i></div>
+    <div class="row" style="margin:10px 0">
+      <input type="text" id="filter" data-i18n-ph="s3.filter"
+             placeholder="Filter by name, domain, email…" style="max-width:280px">
+      <label class="inline"><input type="checkbox" id="only-hit">
+        <span data-i18n="s3.onlyhit">Only rows with contacts</span></label>
+      <span id="run-status" class="muted"></span>
+    </div>
+    <div class="tablewrap">
+      <table id="results">
+        <thead><tr>
+          <th data-i18n="col.company">Company</th>
+          <th class="sortable" data-sort="confidence" data-i18n="col.score">Score</th>
+          <th data-i18n="col.website">Website</th>
+          <th data-i18n="col.keymail">Key emails</th>
+          <th data-i18n="col.othermail">Other emails</th>
+          <th data-i18n="col.phone">Phone</th>
+          <th data-i18n="col.whatsapp">WhatsApp</th>
+          <th data-i18n="col.country">Country</th>
+          <th data-i18n="col.why">Why matched</th>
+          <th data-i18n="col.secs">Secs</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- HISTORY -->
+  <section id="s-history" hidden>
+    <h2 data-i18n="hist.title">Run history</h2>
+    <div class="tablewrap"><table id="history"></table></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+// ---------- i18n ----------
+const STRINGS = {
+  en: {
+    'app.title': 'B2B Contact Finder', 'app.sub': 'runs locally · 127.0.0.1',
+    'nav.history': 'History',
+    's1.title': 'Choose a raw data file', 's1.drop': 'Drag a file here',
+    's1.or': ' or click to browse', 's1.types': '.xlsx · .xlsm · .csv — up to 64 MB',
+    's1.reading': 'Reading file…', 's1.rows': 'rows', 's1.cols': 'columns',
+    's2.title': 'Pick the columns to look up', 's2.sheet': 'Sheet',
+    's2.company': 'Company name column', 's2.country': 'Country column',
+    's2.product': 'Product column', 's2.none': '— not used —',
+    's2.override': 'Shared product keywords (overrides the column, comma separated)',
+    's2.override.ph': 'e.g. cinnamon, cassia, star anise',
+    's2.limit': 'Limit number of companies (blank = all)', 's2.limit.ph': 'e.g. 50',
+    's2.dedupe': 'Merge duplicate companies', 's2.preview': 'Data preview:',
+    's2.advanced': 'Advanced options', 's2.run': 'Start searching',
+    'adv.threads': 'Parallel workers', 'adv.pages': 'Pages per site',
+    'adv.candidates': 'Candidates per company', 'adv.minscore': 'Minimum score',
+    'adv.delay': 'Delay (seconds)', 'adv.other': 'Other', 'adv.cache': 'Cache',
+    'adv.guess': 'Guess emails', 'adv.tls': 'Skip TLS check',
+    'adv.tls.hint': 'Only enable behind a TLS-inspecting proxy',
+    's3.title': 'Results', 's3.scanned': 'scanned', 's3.withcontact': 'with contacts',
+    's3.emails': 'emails', 's3.elapsed': 'elapsed', 's3.stop': 'Stop',
+    's3.csv': 'Download CSV', 's3.xlsx': 'Download Excel',
+    's3.filter': 'Filter by name, domain, email…', 's3.onlyhit': 'Only rows with contacts',
+    'col.company': 'Company', 'col.score': 'Score', 'col.website': 'Website',
+    'col.keymail': 'Key emails', 'col.othermail': 'Other emails', 'col.phone': 'Phone',
+    'col.whatsapp': 'WhatsApp', 'col.country': 'Country', 'col.why': 'Why matched',
+    'col.secs': 'Secs',
+    'hist.title': 'Run history', 'hist.when': 'When', 'hist.label': 'Label',
+    'hist.source': 'Source', 'hist.status': 'Status', 'hist.done': 'Done',
+    'hist.secs': 'Secs', 'hist.open': 'Open', 'hist.excel': 'Excel',
+    'plan.calc': 'Calculating…',
+    'plan.result': '{raw} raw rows → {jobs} companies to look up',
+    'plan.eg': 'e.g.',
+    'run.running': 'running…', 'run.done': 'finished in {s}s', 'run.cancelled': 'stopped',
+    'run.error': 'error: {msg}', 'run.disconnected': 'connection lost',
+    'run.loaded': 'run {id}',
+    'guess.hint': 'guessed from MX record, not confirmed',
+    'err.upload': 'Upload failed',
+  },
+  vi: {
+    'app.title': 'B2B Contact Finder', 'app.sub': 'chạy cục bộ · 127.0.0.1',
+    'nav.history': 'Lịch sử',
+    's1.title': 'Chọn file dữ liệu thô', 's1.drop': 'Kéo thả file vào đây',
+    's1.or': ' hoặc bấm để chọn', 's1.types': '.xlsx · .xlsm · .csv — tối đa 64 MB',
+    's1.reading': 'Đang đọc file…', 's1.rows': 'dòng', 's1.cols': 'cột',
+    's2.title': 'Chọn cột cần tra cứu', 's2.sheet': 'Sheet',
+    's2.company': 'Cột tên công ty', 's2.country': 'Cột quốc gia',
+    's2.product': 'Cột sản phẩm', 's2.none': '— không dùng —',
+    's2.override': 'Từ khoá sản phẩm chung (ghi đè cột, cách nhau bằng dấu phẩy)',
+    's2.override.ph': 'vd: cinnamon, cassia, star anise',
+    's2.limit': 'Giới hạn số công ty (để trống = tất cả)', 's2.limit.ph': 'vd: 50',
+    's2.dedupe': 'Gộp trùng công ty', 's2.preview': 'Xem trước dữ liệu:',
+    's2.advanced': 'Tuỳ chọn nâng cao', 's2.run': 'Bắt đầu tìm',
+    'adv.threads': 'Luồng song song', 'adv.pages': 'Trang mỗi site',
+    'adv.candidates': 'Ứng viên mỗi cty', 'adv.minscore': 'Điểm tối thiểu',
+    'adv.delay': 'Giãn cách (giây)', 'adv.other': 'Khác', 'adv.cache': 'Cache',
+    'adv.guess': 'Đoán email', 'adv.tls': 'Bỏ qua kiểm TLS',
+    'adv.tls.hint': 'Chỉ bật khi máy nằm sau proxy chặn TLS',
+    's3.title': 'Kết quả', 's3.scanned': 'đã quét', 's3.withcontact': 'có liên hệ',
+    's3.emails': 'email', 's3.elapsed': 'thời gian', 's3.stop': 'Dừng',
+    's3.csv': 'Tải CSV', 's3.xlsx': 'Tải Excel',
+    's3.filter': 'Lọc theo tên, domain, email…', 's3.onlyhit': 'Chỉ hiện dòng có liên hệ',
+    'col.company': 'Công ty', 'col.score': 'Điểm', 'col.website': 'Website',
+    'col.keymail': 'Email chính', 'col.othermail': 'Email khác', 'col.phone': 'Điện thoại',
+    'col.whatsapp': 'WhatsApp', 'col.country': 'Nước', 'col.why': 'Vì sao khớp',
+    'col.secs': 'Giây',
+    'hist.title': 'Lịch sử chạy', 'hist.when': 'Thời điểm', 'hist.label': 'Nhãn',
+    'hist.source': 'Nguồn', 'hist.status': 'Trạng thái', 'hist.done': 'Xong',
+    'hist.secs': 'Giây', 'hist.open': 'Mở', 'hist.excel': 'Excel',
+    'plan.calc': 'Đang tính…',
+    'plan.result': '{raw} dòng thô → {jobs} công ty cần tra',
+    'plan.eg': 'vd:',
+    'run.running': 'đang chạy…', 'run.done': 'xong trong {s}s', 'run.cancelled': 'đã dừng',
+    'run.error': 'lỗi: {msg}', 'run.disconnected': 'mất kết nối',
+    'run.loaded': 'lần chạy {id}',
+    'guess.hint': 'đoán từ bản ghi MX, chưa xác nhận',
+    'err.upload': 'Tải lên thất bại',
+  },
+};
+
+let LANG = localStorage.getItem('finder-lang') || 'en';
+
+function t(key, vars) {
+  let s = (STRINGS[LANG] && STRINGS[LANG][key]) || STRINGS.en[key] || key;
+  if (vars) for (const k in vars) s = s.replaceAll('{' + k + '}', vars[k]);
+  return s;
+}
+
+function applyLang() {
+  document.documentElement.lang = LANG;
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    el.textContent = t(el.dataset.i18n);
+  });
+  document.querySelectorAll('[data-i18n-ph]').forEach(el => {
+    el.placeholder = t(el.dataset.i18nPh);
+  });
+  document.querySelectorAll('[data-i18n-title]').forEach(el => {
+    el.title = t(el.dataset.i18nTitle);
+  });
+  $('lang-en').classList.toggle('on', LANG === 'en');
+  $('lang-vi').classList.toggle('on', LANG === 'vi');
+  // Re-render the parts built from JS so they pick up the new language
+  if (state.headers.length) rebuildColumnSelects();
+  if (state.results.length) renderResults();
+  if (!$('s-history').hidden) loadHistory();
+  if (state.fileMeta) showFileInfo(state.fileMeta);
+  if (state.plan) showPlan(state.plan);
+}
+
+document.querySelectorAll('.lang button').forEach(b => {
+  b.onclick = () => { LANG = b.dataset.lang; localStorage.setItem('finder-lang', LANG); applyLang(); };
+});
+
+const state = { fileId: null, headers: [], sheets: [], runId: null, es: null,
+                results: [], sortKey: 'confidence', sortDir: -1, startedAt: 0,
+                timer: null, sample: [], fileMeta: null, plan: null, mapping: {} };
+
+// ---------- upload ----------
+$('drop').onclick = () => $('file').click();
+$('drop').ondragover = (e) => { e.preventDefault(); $('drop').classList.add('over'); };
+$('drop').ondragleave = () => $('drop').classList.remove('over');
+$('drop').ondrop = (e) => {
+  e.preventDefault(); $('drop').classList.remove('over');
+  if (e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]);
+};
+$('file').onchange = (e) => e.target.files[0] && upload(e.target.files[0]);
+
+function dropDefault() {
+  $('drop').innerHTML =
+    `<strong>${esc(t('s1.drop'))}</strong>${esc(t('s1.or'))}<br>` +
+    `<span class="muted">${esc(t('s1.types'))}</span>`;
+}
+
+function showFileInfo(meta) {
+  $('file-info').hidden = false;
+  $('file-info').innerHTML =
+    `<span class="chip">${esc(meta.filename)}</span>` +
+    `<span class="muted">${meta.total_rows.toLocaleString()} ${esc(t('s1.rows'))} · ` +
+    `${meta.headers.length} ${esc(t('s1.cols'))}</span>`;
+}
+
+async function upload(file) {
+  $('file-err').textContent = '';
+  $('drop').innerHTML = `<strong>${esc(t('s1.reading'))}</strong>`;
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const res = await fetch('/api/upload', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || t('err.upload'));
+    state.fileId = data.file_id;
+    state.fileMeta = data;
+    applyTable(data);
+    showFileInfo(data);
+  } catch (err) {
+    $('file-err').textContent = err.message;
+  } finally {
+    dropDefault();
+  }
+}
+
+function rebuildColumnSelects() {
+  const opts = (blank) => (blank ? `<option value="">${esc(t('s2.none'))}</option>` : '') +
+    state.headers.map(h => `<option value="${esc(h)}">${esc(h)}</option>`).join('');
+  const keep = {
+    company: $('col-company').value, country: $('col-country').value,
+    product: $('col-product').value,
+  };
+  $('col-company').innerHTML = opts(false);
+  $('col-country').innerHTML = opts(true);
+  $('col-product').innerHTML = opts(true);
+  const pick = (id, kept, guessed) => {
+    const value = kept || guessed || '';
+    if (value && state.headers.includes(value)) $(id).value = value;
+  };
+  pick('col-company', keep.company, state.mapping.company);
+  pick('col-country', keep.country, state.mapping.country);
+  pick('col-product', keep.product, state.mapping.product);
+}
+
+function applyTable(data) {
+  state.headers = data.headers;
+  state.sheets = data.sheets || [];
+  state.sample = data.sample || [];
+  state.mapping = data.guess || {};
+  $('s-cols').hidden = false;
+
+  if (state.sheets.length > 1) {
+    $('sheet-wrap').hidden = false;
+    $('sheet').innerHTML = state.sheets
+      .map(s => `<option ${s.name === data.sheet ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
+  } else {
+    $('sheet-wrap').hidden = true;
+  }
+
+  rebuildColumnSelects();
+
+  const head = '<thead><tr>' + state.headers.map(h => `<th>${esc(h)}</th>`).join('') + '</tr></thead>';
+  const body = '<tbody>' + state.sample.map(r =>
+    '<tr>' + state.headers.map((_, i) => `<td>${esc((r[i] ?? '').slice(0, 60))}</td>`).join('') + '</tr>'
+  ).join('') + '</tbody>';
+  $('preview').innerHTML = head + body;
+  refreshPlan();
+}
+
+$('sheet').onchange = async () => {
+  const res = await fetch('/api/preview', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ file_id: state.fileId, sheet: $('sheet').value }),
+  });
+  const data = await res.json();
+  if (res.ok) applyTable(data);
+};
+
+// ---------- plan ----------
+function planBody() {
+  const limit = parseInt($('limit').value, 10);
+  return {
+    file_id: state.fileId,
+    sheet: state.sheets.length > 1 ? $('sheet').value : null,
+    company_col: $('col-company').value,
+    country_col: $('col-country').value || null,
+    product_col: $('col-product').value || null,
+    dedupe: $('dedupe').checked,
+    limit: Number.isFinite(limit) && limit > 0 ? limit : null,
+    product_override: $('override').value || null,
+  };
+}
+
+let planTimer = null;
+function refreshPlan() { clearTimeout(planTimer); planTimer = setTimeout(doPlan, 250); }
+['col-company','col-country','col-product','dedupe','limit','override']
+  .forEach(id => { $(id).oninput = refreshPlan; $(id).onchange = refreshPlan; });
+
+function showPlan(data) {
+  const sample = data.jobs.slice(0, 3).map(j => j.company).join(', ');
+  $('plan-info').innerHTML =
+    t('plan.result', { raw: `<strong>${data.raw_rows.toLocaleString()}</strong>`,
+                       jobs: `<strong>${data.job_count.toLocaleString()}</strong>` }) +
+    ` <span class="muted">· ${esc(t('plan.eg'))} ${esc(sample)}</span>`;
+}
+
+async function doPlan() {
+  if (!state.fileId || !$('col-company').value) return;
+  $('btn-run').disabled = true;
+  $('plan-info').textContent = t('plan.calc');
+  const res = await fetch('/api/plan', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(planBody()),
+  });
+  const data = await res.json();
+  if (!res.ok) { $('plan-info').innerHTML = `<span class="err">${esc(data.detail)}</span>`; return; }
+  state.plan = data;
+  showPlan(data);
+  $('btn-run').disabled = data.job_count === 0;
+}
+
+// ---------- run ----------
+$('btn-run').onclick = async () => {
+  const body = Object.assign(planBody(), {
+    threads: +$('threads').value, max_pages: +$('maxpages').value,
+    top_results: +$('topres').value, min_score: +$('minscore').value,
+    delay: +$('delay').value, use_cache: $('usecache').checked,
+    guess_emails: $('guess').checked, insecure_tls: $('insecure').checked,
+  });
+  const res = await fetch('/api/run', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) { $('plan-info').innerHTML = `<span class="err">${esc(data.detail)}</span>`; return; }
+
+  state.runId = data.run_id;
+  state.results = [];
+  state.startedAt = Date.now();
+  $('s-run').hidden = false;
+  $('s-history').hidden = true;
+  $('results').tBodies[0].innerHTML = '';
+  $('run-status').textContent = t('run.running');
+  $('btn-run').disabled = true;
+  $('btn-cancel').disabled = false;
+  clearInterval(state.timer);
+  state.timer = setInterval(() => {
+    $('st-time').textContent = ((Date.now() - state.startedAt) / 1000).toFixed(0) + 's';
+  }, 500);
+  $('s-run').scrollIntoView({ behavior: 'smooth' });
+
+  if (state.es) state.es.close();
+  state.es = new EventSource(`/api/runs/${data.run_id}/events`);
+  state.es.onmessage = (ev) => handleEvent(JSON.parse(ev.data));
+  state.es.onerror = () => { $('run-status').textContent = t('run.disconnected'); state.es.close(); };
+};
+
+function handleEvent(ev) {
+  if (ev.type === 'result') {
+    state.results.push(ev.result);
+    $('st-done').textContent = ev.done;
+    $('bar').style.width = (ev.done / ev.total * 100) + '%';
+    $('st-hit').textContent = state.results.filter(hasContact).length;
+    $('st-mail').textContent = state.results.reduce(
+      (n, r) => n + r.priority_emails.length + r.emails.length, 0);
+    renderResults();
+  } else if (ev.type === 'done' || ev.type === 'cancelled' || ev.type === 'error') {
+    clearInterval(state.timer);
+    $('btn-run').disabled = false;
+    $('btn-cancel').disabled = true;
+    $('run-status').textContent =
+      ev.type === 'done' ? t('run.done', { s: ev.elapsed.toFixed(1) })
+      : ev.type === 'cancelled' ? t('run.cancelled') : t('run.error', { msg: ev.message });
+    if (ev.elapsed) $('st-time').textContent = ev.elapsed.toFixed(0) + 's';
+    state.es && state.es.close();
+  }
+}
+
+$('btn-cancel').onclick = () => state.runId && fetch(`/api/runs/${state.runId}/cancel`, { method: 'POST' });
+$('btn-csv').onclick = () => state.runId && (location.href = `/api/runs/${state.runId}/export.csv`);
+$('btn-xlsx').onclick = () => state.runId && (location.href = `/api/runs/${state.runId}/export.xlsx`);
+
+const hasContact = (r) => r.priority_emails.length || r.emails.length || r.phones.length;
+
+document.querySelectorAll('#results th.sortable').forEach(th => {
+  th.onclick = () => {
+    const key = th.dataset.sort;
+    state.sortDir = state.sortKey === key ? -state.sortDir : -1;
+    state.sortKey = key;
+    renderResults();
+  };
+});
+$('filter').oninput = renderResults;
+$('only-hit').onchange = renderResults;
+
+function renderResults() {
+  const q = $('filter').value.toLowerCase().trim();
+  let rows = state.results.slice();
+  if ($('only-hit').checked) rows = rows.filter(hasContact);
+  if (q) rows = rows.filter(r => JSON.stringify(r).toLowerCase().includes(q));
+  rows.sort((a, b) => (a[state.sortKey] - b[state.sortKey]) * state.sortDir);
+
+  $('results').tBodies[0].innerHTML = rows.map(r => {
+    const cls = r.confidence >= 60 ? 'hi' : r.confidence >= 35 ? 'mid' : 'lo';
+    const site = safeUrl(r.website)
+      ? `<a href="${esc(r.website)}" target="_blank" rel="noopener noreferrer">${esc(short(r.website))}</a>`
+      : esc(r.website || '—');
+    const guessed = r.guessed_emails.length
+      ? `<span class="muted" title="${esc(t('guess.hint'))}">${esc(r.guessed_emails.slice(0,2).join(', '))} ?</span>`
+      : '';
+    return `<tr>
+      <td class="wrap"><strong>${esc(r.company || r.query)}</strong></td>
+      <td class="conf ${cls}">${r.confidence.toFixed(0)}</td>
+      <td>${site}</td>
+      <td class="wrap mono">${esc(r.priority_emails.join(', ')) || guessed || '—'}</td>
+      <td class="wrap mono">${esc(r.emails.slice(0, 4).join(', ')) || '—'}</td>
+      <td class="mono">${esc(r.phones.join(', ')) || '—'}</td>
+      <td class="mono">${esc(r.whatsapp_numbers.join(', ')) || '—'}</td>
+      <td>${esc(r.country || '—')}</td>
+      <td class="wrap muted">${esc(r.match_reason.join('; '))}</td>
+      <td class="muted">${r.elapsed.toFixed(1)}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ---------- history ----------
+$('btn-history').onclick = () => {
+  $('s-history').hidden = !$('s-history').hidden;
+  if (!$('s-history').hidden) loadHistory();
+};
+
+async function loadHistory() {
+  const data = await (await fetch('/api/runs')).json();
+  const head = ['hist.when','hist.label','hist.source','hist.status','hist.done','hist.secs']
+    .map(k => `<th>${esc(t(k))}</th>`).join('');
+  $('history').innerHTML =
+    `<thead><tr>${head}<th></th></tr></thead><tbody>` +
+    data.runs.map(r => `<tr>
+      <td>${new Date(r.created * 1000).toLocaleString()}</td>
+      <td>${esc(r.label || '')}</td>
+      <td class="muted">${esc(r.source || '')}</td>
+      <td>${esc(r.status)}</td>
+      <td>${r.done}/${r.total}</td>
+      <td>${(r.elapsed || 0).toFixed(0)}</td>
+      <td><button data-open="${esc(r.id)}">${esc(t('hist.open'))}</button>
+          <button data-xlsx="${esc(r.id)}">${esc(t('hist.excel'))}</button></td>
+    </tr>`).join('') + '</tbody>';
+
+  $('history').querySelectorAll('[data-open]').forEach(b =>
+    b.onclick = () => loadRun(b.dataset.open));
+  $('history').querySelectorAll('[data-xlsx]').forEach(b =>
+    b.onclick = () => location.href = `/api/runs/${b.dataset.xlsx}/export.xlsx`);
+}
+
+async function loadRun(id) {
+  const data = await (await fetch(`/api/runs/${id}`)).json();
+  state.runId = id;
+  state.results = data.results;
+  $('s-run').hidden = false;
+  $('st-done').textContent = data.results.length;
+  $('st-hit').textContent = data.results.filter(hasContact).length;
+  $('st-mail').textContent = data.results.reduce(
+    (n, r) => n + r.priority_emails.length + r.emails.length, 0);
+  $('st-time').textContent = (data.run.elapsed || 0).toFixed(0) + 's';
+  $('bar').style.width = '100%';
+  $('run-status').textContent = t('run.loaded', { id });
+  $('btn-cancel').disabled = true;
+  renderResults();
+  $('s-run').scrollIntoView({ behavior: 'smooth' });
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g,
+    c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function short(u) { return u.replace(/^https?:\/\//, '').slice(0, 42); }
+// Websites come from search results, so never trust the scheme in an href
+function safeUrl(u) {
+  try {
+    const p = new URL(String(u ?? ''));
+    return p.protocol === 'http:' || p.protocol === 'https:';
+  } catch { return false; }
+}
+
+applyLang();
+dropDefault();
+</script>
+</body>
+</html>
