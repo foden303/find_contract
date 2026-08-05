@@ -105,6 +105,19 @@ declined; removing them is safe at any time (the originals stay in commit
 - [x] `T4.4` Single-page UI: company/domain/keyword input, CSV upload, country and product selection, table sorted by `confidence`, "why matched" detail, CSV export `cc:done`
 - [x] `T4.5` `make web` + README update `cc:done`
 - [x] `T4.6` EN/VI language toggle in the UI, English by default, choice remembered `cc:done`
+- [x] `T4.7` Theme toggle (auto → light → dark), remembered; explicit choice overrides the OS `cc:done`
+- [x] `T4.8` `--merge-sources` / *Merge all candidates*: scrape every qualifying site and pool the contacts, instead of stopping at the first productive one `cc:done`
+
+## Phase 6 — Pipeline hardening  `cc:done`
+
+Driven by an architecture review of ten proposed solutions; the LLM steps were
+explicitly deferred.
+
+- [x] `T6.1` Normalise company names before dedup — wire the existing `normalize_company` into `build_jobs`; split legal forms from descriptors so identity and domain-matching use different rules `cc:done`
+- [x] `T6.2` Company store: a `companies` table keyed by normalised name, so a repeat lookup is a SELECT (26s → 0.2s), 90-day TTL `cc:done`
+- [x] `T6.3` Pluggable search backends behind one interface: DuckDuckGo (default), self-hosted SearXNG, Brave, Serper — with per-provider concurrency `cc:done`
+- [x] `T6.4` Address column: extract the locality, use it as a query variant and a 14-point scoring signal, set `address_confirmed` when the site names the city `cc:done`
+- [x] `T6.5` A configured backend that cannot be reached aborts the run instead of reporting every company as having no web presence `cc:done`
 
 ## Phase 5 — Verification  `cc:done`
 
@@ -188,3 +201,27 @@ numbers.
   web presence.
 - CLI UX bug: a mistyped CSV path used to be searched for on the web as if it
   were a company name; it now fails with a clear error.
+- Merge mode, after the observation that "Candidates per company: 3" was a
+  ceiling rather than a target — the scan stopped at the first site that
+  produced anything, so in practice one website was read. Building it surfaced
+  two follow-on problems worth recording: search returns several pages of the
+  same domain (fixed by deduplicating on registrable domain), and listings
+  sites clear the score threshold on country and product alone (fixed by
+  requiring a secondary domain to resemble the company name).
+- Fuzzy name matching was **built, measured and then defaulted off**. On the
+  real file `VINAY ENTERPRISES` vs `VINAYAK ENTERPRISES` (different companies)
+  scores 94, while `FRESHDRINKUS GLOBAL LLC` vs `...LCC` (a typo, same company)
+  scores 92 — the wrong merge outranks the right one, so no threshold works.
+  Known misspellings became exact tokens instead. Every merge worth having
+  already scores 100 after normalisation.
+- Merge mode initially scraped a listings site and returned `care@magicpin.in`
+  as the company's email; secondary domains must now resemble the company name.
+- Pointing SearXNG at a dead URL first produced "no search results" with status
+  `done` — the exact silent failure the design was meant to prevent. The
+  exception was being swallowed twice: once by the generic retry handler, and
+  again by `search_many`'s `return_exceptions=True`.
+- `name_similarity` gave partial credit to a short name appearing anywhere
+  inside a much longer domain — "triveni" inside "indiayellowpagesonline"
+  scored 53. Partial matching now requires comparable lengths. This dropped a
+  false CK PHARM match from 49.8 to 27.0, below the scrape threshold, so it
+  returns nothing instead of an unrelated Armenian pharmacy's address.

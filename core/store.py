@@ -29,6 +29,20 @@ CREATE TABLE IF NOT EXISTS run_results (
     PRIMARY KEY (run_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_runs_created ON runs (created DESC);
+
+-- One row per company, keyed by its normalised name. Re-running a file, or
+-- running a different file containing the same importer, becomes a SELECT
+-- instead of a fresh round of searching and scraping.
+CREATE TABLE IF NOT EXISTS companies (
+    key        TEXT PRIMARY KEY,
+    name       TEXT,
+    country    TEXT,
+    website    TEXT,
+    confidence REAL,
+    payload    TEXT NOT NULL,
+    updated    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_companies_updated ON companies (updated DESC);
 """
 
 
@@ -93,6 +107,54 @@ class Store:
                 "SELECT payload FROM run_results WHERE run_id = ? ORDER BY seq", (run_id,)
             ).fetchall()
         return [json.loads(r["payload"]) for r in rows]
+
+    # --- Company lookup table --------------------------------------------
+
+    def get_company(self, key: str, ttl: float) -> dict | None:
+        """Return a stored result for this normalised company name, if fresh."""
+        if not key:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payload, updated FROM companies WHERE key = ?", (key,)
+            ).fetchone()
+        if not row or (time.time() - row["updated"]) > ttl:
+            return None
+        try:
+            return json.loads(row["payload"])
+        except json.JSONDecodeError:
+            return None
+
+    def save_company(self, key: str, result: Result) -> None:
+        """Remember a result. Only worth storing when we actually found a site."""
+        if not key or not result.website:
+            return
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO companies"
+                " (key, name, country, website, confidence, payload, updated)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (key, result.company, result.country, result.website,
+                 result.confidence, json.dumps(asdict(result), ensure_ascii=False),
+                 time.time()),
+            )
+            self._conn.commit()
+
+    def count_companies(self) -> int:
+        with self._lock:
+            return self._conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
+
+    def search_companies(self, term: str, limit: int = 50) -> list[dict]:
+        """Free-text lookup over everything learned so far."""
+        like = f"%{term.lower()}%"
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key, name, country, website, confidence, updated FROM companies"
+                " WHERE lower(name) LIKE ? OR lower(website) LIKE ?"
+                " ORDER BY confidence DESC LIMIT ?",
+                (like, like, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def delete_run(self, run_id: str) -> None:
         with self._lock:

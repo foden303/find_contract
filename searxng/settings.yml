@@ -1,0 +1,34 @@
+# SearXNG configuration for the B2B Contact Finder.
+#
+# Only the settings that matter here are overridden; everything else comes from
+# SearXNG's own defaults.
+
+use_default_settings: true
+
+server:
+  # Replaced at boot from the SEARXNG_SECRET environment variable
+  secret_key: "set-by-environment"
+  # The limiter exists to stop strangers hammering a public instance. This one
+  # is reachable only by the app container, and the limiter would throttle our
+  # own batch runs — which is the exact ceiling we self-hosted to escape.
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  # THE important one. SearXNG serves HTML only unless json is listed here,
+  # and the finder talks to it over the JSON API.
+  formats:
+    - html
+    - json
+  safe_search: 0
+  autocomplete: ""
+
+ui:
+  static_use_hash: true
+
+outgoing:
+  request_timeout: 6.0
+  max_request_timeout: 12.0
+  pool_connections: 100
+  pool_maxsize: 20

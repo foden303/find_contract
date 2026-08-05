@@ -8,6 +8,19 @@ DEFAULT_TIMEOUT = 12
 DEFAULT_PER_HOST_CONCURRENCY = 4
 DEFAULT_CACHE_TTL = 7 * 24 * 3600  # a week
 
+def data_dir() -> str:
+    """Where the SQLite files live.
+
+    Defaults to the project directory; a container overrides it with
+    FINDER_CACHE_DIR so the data survives on a mounted volume.
+    """
+    path = os.getenv("FINDER_CACHE_DIR") or os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -125,6 +138,21 @@ DIRECTORY_HOSTS = {
 }
 
 
+# --- Search providers ------------------------------------------------------
+
+# How many searches may be in flight at once, per provider. DuckDuckGo is
+# scraped rather than API-served and throttles hard; a self-hosted SearXNG is
+# limited only by your own machine and the engines it federates to.
+SEARCH_CONCURRENCY = {
+    "ddg": 6,
+    "searxng": 16,
+    "brave": 10,
+    "serper": 10,
+}
+
+SEARCH_PROVIDERS = tuple(SEARCH_CONCURRENCY)
+
+
 @dataclass
 class Config:
     """Runtime knobs shared by the CLI and the web UI."""
@@ -139,11 +167,7 @@ class Config:
 
     use_cache: bool = True
     cache_ttl: int = DEFAULT_CACHE_TTL
-    cache_path: str = field(
-        default_factory=lambda: os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cache.db"
-        )
-    )
+    cache_path: str = field(default_factory=lambda: os.path.join(data_dir(), ".cache.db"))
 
     # Skip TLS certificate verification. Off by default. Turn it on only on a
     # machine behind a TLS-inspecting proxy, where every request otherwise
@@ -154,6 +178,32 @@ class Config:
         default_factory=lambda: os.getenv("FINDER_INSECURE_TLS", "").lower()
         in ("1", "true", "yes")
     )
+
+    # Which search backend to use. "ddg" needs nothing; "searxng" points at a
+    # self-hosted instance (no API key, no per-query cost, and it federates
+    # several engines so recall is better); "brave"/"serper" need an API key.
+    search_provider: str = field(
+        default_factory=lambda: os.getenv("FINDER_SEARCH_PROVIDER", "ddg").lower()
+    )
+    # Base URL of the SearXNG instance. Its settings.yml must enable the JSON
+    # output format — `search: formats: [html, json]` — which is off by default.
+    searxng_url: str = field(
+        default_factory=lambda: os.getenv("FINDER_SEARXNG_URL", "http://127.0.0.1:8080")
+    )
+    search_api_key: str | None = field(
+        default_factory=lambda: os.getenv("FINDER_SEARCH_API_KEY")
+    )
+
+    # How long a stored company result stays usable before it is looked up
+    # again. Contact details drift slowly; three months is a sane refresh.
+    company_ttl: int = 90 * 24 * 3600
+    use_company_store: bool = True
+
+    # Scan every candidate above min_score and merge their contacts, instead of
+    # stopping at the first one that yields something. Slower, but it collects
+    # from a company's main site, its regional site and its trade profile
+    # together rather than whichever happened to rank first.
+    merge_sources: bool = False
 
     # Stop scanning a site once we hold a priority email and a valid phone
     early_exit: bool = True

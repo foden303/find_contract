@@ -14,16 +14,19 @@ from core.extract import (
     prioritize_emails,
 )
 from core.fetch import Fetcher
+from core.tabular import dedupe_key, extract_locality
 from core.models import Candidate, ContactExtract, Result
-from core.scoring import rank_candidates
+from core.scoring import name_similarity, rank_candidates
 from core.search import (
     SearchClient,
+    SearchError,
     build_company_queries,
     build_discovery_queries,
 )
 from core.utils import (
     EMAIL_RE,
     clean_email,
+    domain_core,
     extract_domain,
     is_domain_like,
     normalize_url,
@@ -37,11 +40,25 @@ ProgressFn = Callable[[dict], None | Awaitable[None]]
 # stray third party's.
 OFF_DOMAIN_TRUST = 45.0
 
+# In merge mode, how much a secondary domain must resemble the company name
+# before we trust it as another of that company's own sites.
+MERGE_NAME_FLOOR = 45.0
+
 
 # One company's contact page lists a handful of numbers. Anything past this is
 # a directory of other people's companies.
 MAX_PHONES_PER_PAGE = 12
 MAX_EMAILS_PER_PAGE = 25
+
+
+def _mentions_locality(html: str, locality: str) -> bool:
+    """Does the page name the city we expect this company to be in?"""
+    lowered = (html or "").lower()
+    return any(
+        token in lowered
+        for token in (t.strip().lower() for t in locality.split(","))
+        if len(token) > 3
+    )
 
 
 def _is_listing_page(found: ContactExtract) -> bool:
@@ -52,22 +69,21 @@ def _is_listing_page(found: ContactExtract) -> bool:
 
 
 def _filter_emails(
-    emails: set[str], site_domain: str, confidence: float
+    emails: set[str], site_domains: set[str], confidence: float
 ) -> tuple[list[str], list[str]]:
     """Separate the company's own addresses from third parties on the page.
 
     A journal article lists its authors' addresses, a directory lists its own
     support inbox — both look identical to a real find until you notice the
-    domain does not match the site we scanned.
+    domain does not match any site we scanned. `site_domains` holds every
+    scraped source, so merge mode does not discard the second site's own mail.
     """
     kept, rejected = [], []
     for email in sorted(emails):
         _, _, domain_part = email.partition("@")
         if not domain_part:
             continue
-        if (site_domain and extract_domain(domain_part) == site_domain) or (
-            confidence >= OFF_DOMAIN_TRUST
-        ):
+        if extract_domain(domain_part) in site_domains or confidence >= OFF_DOMAIN_TRUST:
             kept.append(email)
         else:
             rejected.append(email)
@@ -103,14 +119,14 @@ async def _select_candidates(
     products: list[str],
     config: Config,
     search: SearchClient,
+    locality: str = "",
 ) -> list[Candidate]:
-    queries = build_company_queries(query, country, products)
+    queries = build_company_queries(query, country, products, locality)
     found = await search.search_many(queries, limit=8, country=country)
     if not found:
         return []
 
-    ranked = rank_candidates(found, query, country, products)
-    return ranked
+    return rank_candidates(found, query, country, products, locality)
 
 
 async def _scan_site(
@@ -121,6 +137,7 @@ async def _scan_site(
     collected: ContactExtract,
     res: Result,
     max_pages: int | None = None,
+    locality: str = "",
 ) -> None:
     """Fetch a candidate's homepage plus its best contact pages."""
     page_budget = config.max_pages if max_pages is None else max_pages
@@ -138,6 +155,12 @@ async def _scan_site(
     homepage_data = extract_contacts(home.html, home.final_url, region, tree=tree)
     collected.merge(homepage_data)
     res.pages_scanned.append(home.final_url)
+
+    # Finding the company's own city on its own site is the strongest
+    # confirmation available short of contacting them.
+    if locality and not res.address_confirmed and _mentions_locality(home.html, locality):
+        res.address_confirmed = True
+        res.match_reason.append("address confirmed on site")
 
     if config.early_exit:
         priority, _ = prioritize_emails(sorted(collected.emails))
@@ -169,12 +192,16 @@ async def scan_company(
     search: SearchClient,
     country: str | None = None,
     products: list[str] | None = None,
+    address: str | None = None,
     on_event: ProgressFn | None = None,
 ) -> Result:
     started = time.perf_counter()
     products = products or []
     region = region_for_country(country)
-    res = Result(query=query, country=country, products=products)
+    # A full postal address is useless as a search term, but the city it
+    # contains both sharpens the query and confirms a match on the page.
+    locality = extract_locality(address or "", country)
+    res = Result(query=query, country=country, products=products, address=address)
     collected = ContactExtract()
 
     await _emit(on_event, {"type": "company_start", "query": query})
@@ -187,7 +214,9 @@ async def scan_company(
         res.is_direct_hit = True
     else:
         res.company = query
-        candidates = await _select_candidates(query, country, products, config, search)
+        candidates = await _select_candidates(
+            query, country, products, config, search, locality
+        )
 
     if not candidates:
         res.notes.append("no search results")
@@ -204,7 +233,35 @@ async def scan_company(
     # Below the bar the best hit is a directory or an article that merely
     # mentions the company. Record it as a lead to check by hand, but do not
     # scrape it — its emails and phones belong to somebody else.
-    scannable = [c for c in candidates if c.score >= config.min_score][: config.top_results]
+    above_bar = [c for c in candidates if c.score >= config.min_score]
+    if config.merge_sources:
+        # Search often returns three pages of one site. Merging those is not
+        # "several sources", so keep the best-scoring hit per registrable
+        # domain — the site's own crawl already covers its other pages.
+        by_domain: dict[str, Candidate] = {}
+        for cand in above_bar:
+            domain = extract_domain(cand.url)
+            if domain not in by_domain:
+                by_domain[domain] = cand
+        merged = list(by_domain.values())
+
+        # Only merge from domains that plausibly belong to this company. A
+        # listings site can clear min_score on country and product alone, and
+        # scraping it hands back its own support inbox as the company's. There
+        # are far too many such sites to blacklist by hand, so test the name.
+        own = [
+            c for c in merged
+            if c is best or name_similarity(query, domain_core(c.url)) >= MERGE_NAME_FLOOR
+        ]
+        kept_ids = {id(c) for c in own}
+        skipped = [c for c in merged if id(c) not in kept_ids]
+        if skipped:
+            res.notes.append(
+                "merge skipped unrelated domains: "
+                + ", ".join(extract_domain(c.url) for c in skipped[:5])
+            )
+        above_bar = own
+    scannable = above_bar[: config.top_results]
     if not scannable:
         res.match_reason.append(
             f"below threshold ({best.score:.0f} < {config.min_score:.0f}) — not scanned"
@@ -215,6 +272,7 @@ async def scan_company(
         return res
 
     # 2. Harvest each candidate, best first
+    scanned_domains: set[str] = set()
     for rank, cand in enumerate(scannable):
         collected.merge(_contacts_from_snippet(cand.snippet, region))
         if cand.snippet:
@@ -223,7 +281,7 @@ async def scan_company(
         if cand.is_snippet_only:
             continue
 
-        if rank > 0:
+        if rank > 0 and not config.merge_sources:
             # Runners-up are only worth the round trips when the best result
             # came back empty, and never when they score far below it.
             if collected.emails or collected.phones:
@@ -232,18 +290,27 @@ async def scan_company(
                 res.notes.append(f"skipped weaker candidate {cand.url}")
                 break
 
-        # The top hit gets the full page budget; fallbacks get a shallow look.
-        budget = config.max_pages if rank == 0 else max(3, config.max_pages // 3)
-        await _scan_site(cand, config, fetcher, region, collected, res, budget)
+        # In merge mode every candidate gets the full budget, because each one
+        # is a source in its own right rather than a fallback.
+        if config.merge_sources:
+            budget = config.max_pages
+        else:
+            budget = config.max_pages if rank == 0 else max(3, config.max_pages // 3)
 
-        if config.early_exit:
+        await _scan_site(cand, config, fetcher, region, collected, res, budget, locality)
+        res.sources.append(f"{cand.score:.0f} {cand.url}")
+        scanned_domains.add(extract_domain(cand.url))
+
+        if config.early_exit and not config.merge_sources:
             priority, _ = prioritize_emails(sorted(collected.emails))
             if priority and collected.phones:
                 break
 
     # 3. Consolidate, dropping addresses that belong to somebody else
-    site_domain = extract_domain(res.website) if res.website else ""
-    kept, rejected = _filter_emails(collected.emails, site_domain, res.confidence)
+    if res.website:
+        scanned_domains.add(extract_domain(res.website))
+    scanned_domains.discard("")
+    kept, rejected = _filter_emails(collected.emails, scanned_domains, res.confidence)
     if rejected:
         res.notes.append(f"ignored off-domain emails: {', '.join(rejected[:5])}")
 
@@ -284,10 +351,11 @@ async def scan_company(
 
 
 async def process_batch(
-    rows: list[tuple[str, str | None, list[str]]],
+    rows: list[tuple],
     config: Config,
     on_event: ProgressFn | None = None,
     cache: Cache | None = None,
+    store=None,
 ) -> list[Result]:
     """Scan many companies concurrently, preserving input order in the output."""
     if not rows:
@@ -302,18 +370,48 @@ async def process_batch(
 
     async with Fetcher(config, cache) as fetcher:
 
-        async def one(index: int, row: tuple[str, str | None, list[str]]) -> Result:
+        async def one(index: int, row: tuple) -> Result:
             nonlocal done
-            name, country, products = row
+            # Rows may carry an optional 4th element, the postal address
+            name, country, products, *extra = row
+            address = extra[0] if extra else None
+
+            # A company already looked up recently needs no network at all
+            key = dedupe_key(name) if store and config.use_company_store else ""
+            if key:
+                remembered = store.get_company(key, config.company_ttl)
+                if remembered:
+                    res = Result(**remembered)
+                    res.notes.append("from company store")
+                    res.elapsed = 0.0
+                    async with lock:
+                        done += 1
+                        position = done
+                    await _emit(on_event, {
+                        "type": "progress", "index": index,
+                        "done": position, "total": total, "result": res,
+                    })
+                    return res
+
             async with sem:
                 try:
                     res = await scan_company(
                         name, config, fetcher, search,
-                        country=country, products=products, on_event=on_event,
+                        country=country, products=products, address=address,
+                        on_event=on_event,
                     )
+                except SearchError:
+                    # The backend itself is misconfigured or unreachable. Every
+                    # remaining row would fail identically and look like "no
+                    # web presence", so stop the run and say why.
+                    raise
                 except Exception as exc:  # one bad row must not sink the batch
-                    res = Result(query=name, company=name, country=country, products=products)
+                    res = Result(query=name, company=name, country=country,
+                                 products=products, address=address)
                     res.notes.append(f"error: {exc}")
+                else:
+                    if key:
+                        store.save_company(key, res)
             async with lock:
                 done += 1
                 position = done

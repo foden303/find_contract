@@ -9,18 +9,26 @@ import time
 from dataclasses import asdict
 
 from core.cache import Cache
-from core.config import DEFAULT_MAX_PAGES, DEFAULT_MAX_THREADS_COMPANIES, Config
+from core.config import (
+    DEFAULT_MAX_PAGES,
+    DEFAULT_MAX_THREADS_COMPANIES,
+    Config,
+    data_dir,
+)
 from core.models import Result
 from core.pipeline import discover_trade_leads, process_batch
+from core.store import Store
 from core.tabular import build_jobs, load_table
 
 TABLE_EXTS = (".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls")
+RUNS_DB = os.path.join(data_dir(), ".runs.db")
 
 CSV_FIELDS = [
     "query", "company", "country", "products", "website", "confidence",
     "match_reason", "priority_emails", "emails", "guessed_emails",
     "phones", "whatsapp_numbers", "whatsapp_links", "social_links",
-    "pages_scanned", "alternates", "elapsed_sec", "notes",
+    "address", "address_confirmed", "pages_scanned", "sources",
+    "alternates", "elapsed_sec", "notes",
 ]
 
 
@@ -30,6 +38,7 @@ def parse_args(argv: list[str]):
     p.add_argument("--keyword", action="store_true", help="Discovery mode using product keywords")
     p.add_argument("--country", help="Country of the target companies")
     p.add_argument("--product", help="Product filter (comma-separated)")
+    p.add_argument("--address", help="Postal address of the target company")
     p.add_argument("--limit", type=int, default=10, help="Max leads in discovery mode")
     p.add_argument("--threads", type=int, default=DEFAULT_MAX_THREADS_COMPANIES,
                    help="Companies scanned concurrently")
@@ -47,6 +56,9 @@ def parse_args(argv: list[str]):
     p.add_argument("--no-guess", action="store_true", help="Do not generate info@/sales@ fallbacks")
     p.add_argument("--no-early-exit", action="store_true",
                    help="Scan every page even after contacts are found")
+    p.add_argument("--merge-sources", action="store_true",
+                   help="Scan every candidate above --min-score and merge their contacts, "
+                        "instead of stopping at the first site that yields something")
     p.add_argument("--out", help="Output CSV file path")
     p.add_argument("--json", action="store_true", help="Print results as JSON")
     p.add_argument("--sheet", help="Worksheet name (Excel files with several sheets)")
@@ -57,6 +69,16 @@ def parse_args(argv: list[str]):
     p.add_argument("--csv-column", default="company", help="Column holding the company/domain")
     p.add_argument("--country-column", default="country", help="Column holding the country")
     p.add_argument("--product-column", default="product", help="Column holding the product")
+    p.add_argument("--address-column", default="address", help="Column holding the address")
+    p.add_argument("--fuzzy-dedupe", action="store_true",
+                   help="Also merge near-identical company names (risky, off by default)")
+    p.add_argument("--no-company-store", action="store_true",
+                   help="Do not reuse or record results in the company table")
+    p.add_argument("--search-provider", default=None,
+                   choices=["ddg", "searxng", "brave", "serper"],
+                   help="Search backend (default ddg; searxng needs no API key)")
+    p.add_argument("--searxng-url", default=None,
+                   help="Base URL of your SearXNG instance")
     return p.parse_args(argv)
 
 
@@ -80,7 +102,10 @@ def write_csv(results: list[Result], out_path: str) -> None:
                 "whatsapp_numbers": " | ".join(r.whatsapp_numbers),
                 "whatsapp_links": " | ".join(r.whatsapp_links),
                 "social_links": " | ".join(r.social_links),
+                "address": r.address or "",
+                "address_confirmed": "yes" if r.address_confirmed else "",
                 "pages_scanned": " | ".join(r.pages_scanned),
+                "sources": " | ".join(r.sources),
                 "alternates": " | ".join(r.alternates),
                 "elapsed_sec": f"{r.elapsed:.1f}",
                 "notes": " | ".join(r.notes),
@@ -125,11 +150,19 @@ async def run(args) -> list[Result]:
         min_score=args.min_score,
         use_cache=not args.no_cache,
         insecure_tls=args.insecure_tls,
+        use_company_store=not args.no_company_store,
         guess_emails=not args.no_guess,
         early_exit=not args.no_early_exit,
+        merge_sources=args.merge_sources,
         json_out=args.json,
     )
+    if args.search_provider:
+        config.search_provider = args.search_provider
+    if args.searxng_url:
+        config.searxng_url = args.searxng_url
+
     cache = Cache(config.cache_path, config.cache_ttl, config.use_cache)
+    store = Store(RUNS_DB) if config.use_company_store else None
     cli_products = [p.strip() for p in args.product.split(",") if p.strip()] if args.product else []
 
     def on_event(event: dict) -> None:
@@ -152,7 +185,7 @@ async def run(args) -> list[Result]:
         if not args.json:
             print(f"[*] {len(leads)} candidate companies found. Extracting contacts...")
         rows = [(lead.title or lead.url, args.country, cli_products) for lead in leads]
-        return await process_batch(rows, config, on_event=on_event, cache=cache)
+        return await process_batch(rows, config, on_event=on_event, cache=cache, store=store)
 
     # 2. Batch mode from a spreadsheet or CSV
     if args.input_value.lower().endswith(TABLE_EXTS):
@@ -167,18 +200,21 @@ async def run(args) -> list[Result]:
             company_col=args.csv_column,
             country_col=args.country_column if args.country_column in headers else None,
             product_col=args.product_column if args.product_column in headers else None,
+            address_col=args.address_column if args.address_column in headers else None,
             dedupe=not args.no_dedupe,
+            fuzzy=args.fuzzy_dedupe,
             limit=args.limit if args.limit_rows else None,
             product_override=cli_products,
         )
         if not args.json:
             print(f"[*] {sheet}: {len(table)} rows -> {len(jobs)} companies to scan...")
         rows = [j.as_row() for j in jobs]
-        return await process_batch(rows, config, on_event=on_event, cache=cache)
+        return await process_batch(rows, config, on_event=on_event, cache=cache, store=store)
 
     # 3. Single company / domain
     results = await process_batch(
-        [(args.input_value, args.country, cli_products)], config, cache=cache
+        [(args.input_value, args.country, cli_products, args.address)],
+        config, cache=cache, store=store,
     )
     if not args.json:
         for r in results:

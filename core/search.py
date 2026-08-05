@@ -1,20 +1,22 @@
-"""DuckDuckGo access: pooled clients, bounded parallelism, cached results."""
+"""Web search: pluggable backends, bounded parallelism, cached results.
+
+Every backend returns the same shape — a list of {title, href, body} dicts —
+so the rest of the pipeline never learns which one is in use.
+"""
 
 import asyncio
 import hashlib
 import queue
 import random
 
+import httpx
 from ddgs.ddgs import DDGS
 
 from core.cache import Cache
-from core.config import SKIP_HOSTS, Config
+from core.config import SEARCH_CONCURRENCY, SKIP_HOSTS, USER_AGENT, Config
 from core.models import Candidate
 from core.utils import host_of, normalize_url, region_for_country
 
-# DDG throttles hard, but 3 was a global bottleneck across the whole batch.
-# Six in flight with backoff measures faster end-to-end than three without.
-MAX_CONCURRENT_SEARCHES = 6
 MAX_ATTEMPTS = 3
 
 # ISO region -> DuckDuckGo region code (DDG uses `uk` rather than `gb`)
@@ -28,18 +30,53 @@ def ddg_region(country: str | None) -> str | None:
     return f"{_DDG_REGION_OVERRIDE.get(iso, iso).lower()}-en"
 
 
+class SearchError(RuntimeError):
+    """Raised when a backend is misconfigured, so it fails loudly not silently."""
+
+
 class SearchClient:
-    """Wraps DDGS in a small reusable pool and runs queries off the event loop."""
+    """One entry point over several search backends, with cache and retries."""
 
     def __init__(self, config: Config, cache: Cache | None = None):
         self.config = config
         self.cache = cache or Cache(config.cache_path, config.cache_ttl, config.use_cache)
-        self._sem = asyncio.Semaphore(MAX_CONCURRENT_SEARCHES)
-        self._pool: queue.Queue = queue.Queue()
-        for _ in range(MAX_CONCURRENT_SEARCHES):
-            self._pool.put(
-                DDGS(timeout=self.config.timeout, verify=not self.config.insecure_tls)
+
+        self.provider = (config.search_provider or "ddg").lower()
+        if self.provider not in SEARCH_CONCURRENCY:
+            raise SearchError(
+                f"Unknown search provider {self.provider!r}. "
+                f"Choose one of: {', '.join(SEARCH_CONCURRENCY)}"
             )
+        if self.provider in ("brave", "serper") and not config.search_api_key:
+            raise SearchError(
+                f"Provider {self.provider!r} needs an API key — set FINDER_SEARCH_API_KEY."
+            )
+
+        self.concurrency = SEARCH_CONCURRENCY[self.provider]
+        self._sem = asyncio.Semaphore(self.concurrency)
+        self._http: httpx.AsyncClient | None = None
+        # Queries that gave up after every retry. A run ending with a high
+        # count did not find "no companies" — it failed to search.
+        self.failures = 0
+
+        # DDGS is synchronous, so it gets a pool of clients driven from threads.
+        self._pool: queue.Queue = queue.Queue()
+        if self.provider == "ddg":
+            for _ in range(self.concurrency):
+                self._pool.put(
+                    DDGS(timeout=config.timeout, verify=not config.insecure_tls)
+                )
+
+    # --- backends --------------------------------------------------------
+
+    def _http_client(self) -> httpx.AsyncClient:
+        if self._http is None:
+            self._http = httpx.AsyncClient(
+                timeout=self.config.timeout,
+                verify=not self.config.insecure_tls,
+                headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            )
+        return self._http
 
     def _blocking_search(self, query: str, limit: int, region: str | None) -> list[dict]:
         client = self._pool.get()
@@ -51,11 +88,84 @@ class SearchClient:
         finally:
             self._pool.put(client)
 
+    async def _searxng(self, query: str, limit: int, region: str | None) -> list[dict]:
+        """Self-hosted SearXNG. Aggregates several engines; no key, no quota."""
+        params = {"q": query, "format": "json", "categories": "general", "safesearch": "0"}
+        if region:
+            params["language"] = region.split("-")[0]
+
+        resp = await self._http_client().get(
+            self.config.searxng_url.rstrip("/") + "/search", params=params
+        )
+        if resp.status_code == 403:
+            raise SearchError(
+                "SearXNG refused the request. Enable the JSON output in its "
+                "settings.yml:  search:\\n    formats:\\n      - html\\n      - json"
+            )
+        resp.raise_for_status()
+        try:
+            payload = resp.json()
+        except ValueError:
+            raise SearchError(
+                "SearXNG returned HTML rather than JSON — the json format is "
+                "not enabled in its settings.yml."
+            )
+        return [
+            {"title": r.get("title", ""), "href": r.get("url", ""), "body": r.get("content", "")}
+            for r in (payload.get("results") or [])[:limit]
+        ]
+
+    async def _brave(self, query: str, limit: int, region: str | None) -> list[dict]:
+        resp = await self._http_client().get(
+            "https://api.search.brave.com/res/v1/web/search",
+            params={"q": query, "count": min(limit, 20)},
+            headers={"X-Subscription-Token": self.config.search_api_key,
+                     "Accept": "application/json"},
+        )
+        resp.raise_for_status()
+        results = (resp.json().get("web") or {}).get("results") or []
+        return [
+            {"title": r.get("title", ""), "href": r.get("url", ""),
+             "body": r.get("description", "")}
+            for r in results[:limit]
+        ]
+
+    async def _serper(self, query: str, limit: int, region: str | None) -> list[dict]:
+        resp = await self._http_client().post(
+            "https://google.serper.dev/search",
+            json={"q": query, "num": min(limit, 20)},
+            headers={"X-API-KEY": self.config.search_api_key},
+        )
+        resp.raise_for_status()
+        return [
+            {"title": r.get("title", ""), "href": r.get("link", ""),
+             "body": r.get("snippet", "")}
+            for r in (resp.json().get("organic") or [])[:limit]
+        ]
+
+    async def _run_backend(self, query: str, limit: int, region: str | None) -> list[dict]:
+        if self.provider == "ddg":
+            return await asyncio.to_thread(self._blocking_search, query, limit, region)
+        if self.provider == "searxng":
+            return await self._searxng(query, limit, region)
+        if self.provider == "brave":
+            return await self._brave(query, limit, region)
+        return await self._serper(query, limit, region)
+
+    async def aclose(self) -> None:
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
+
     async def search(
         self, query: str, limit: int = 10, country: str | None = None
     ) -> list[Candidate]:
         region = ddg_region(country)
-        key = hashlib.sha1(f"{query}|{limit}|{region}".encode()).hexdigest()
+        # The provider is part of the key: results differ between backends, so
+        # switching provider must not serve the previous one's cached answers.
+        key = hashlib.sha1(
+            f"{self.provider}|{query}|{limit}|{region}".encode()
+        ).hexdigest()
 
         cached = self.cache.get_search(key)
         if cached is not None:
@@ -65,14 +175,28 @@ class SearchClient:
         async with self._sem:
             for attempt in range(MAX_ATTEMPTS):
                 try:
-                    rows = await asyncio.to_thread(self._blocking_search, query, limit, region)
+                    rows = await self._run_backend(query, limit, region)
                     break
+                except SearchError:
+                    # Misconfiguration: retrying cannot help, and swallowing it
+                    # would look exactly like "this company has no web presence".
+                    raise
                 except Exception as exc:
                     if attempt == MAX_ATTEMPTS - 1:
+                        # A configured backend that never answers is a setup
+                        # problem, not an absent company. DuckDuckGo is scraped
+                        # and flakes on individual queries, so it stays lenient.
+                        if self.provider != "ddg":
+                            raise SearchError(
+                                f"{self.provider} search failed after "
+                                f"{MAX_ATTEMPTS} attempts: {exc}. Check the "
+                                f"backend is running and reachable."
+                            ) from exc
                         print(f"[!] Search failed for '{query}': {exc}")
+                        self.failures += 1
                         rows = []
                         break
-                    # Exponential backoff with jitter; DDG rate-limits bursts
+                    # Exponential backoff with jitter; engines rate-limit bursts
                     await asyncio.sleep(1.5 * (2**attempt) + random.random())
 
         candidates = []
@@ -110,6 +234,9 @@ class SearchClient:
         )
         merged: dict[str, Candidate] = {}
         for batch in batches:
+            if isinstance(batch, SearchError):
+                # A broken backend must not be reduced to "found nothing"
+                raise batch
             if isinstance(batch, BaseException):
                 continue
             for cand in batch:
@@ -119,7 +246,7 @@ class SearchClient:
 
 
 def build_company_queries(
-    company: str, country: str | None, products: list[str]
+    company: str, country: str | None, products: list[str], locality: str = ""
 ) -> list[str]:
     """Queries from most to least specific.
 
@@ -148,6 +275,10 @@ def build_company_queries(
     # reach for companies whose site never names their country.
     if country and prod:
         queries.append(f"{company} {prod}")
+
+    # The city disambiguates same-named companies far better than the country
+    if locality:
+        queries.append(f"{company} {locality}")
 
     queries.append(
         f"{company} {country} contact email" if country else f"{company} official website contact"

@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel
 
 from core.cache import Cache
-from core.config import Config
+from core.config import Config, data_dir
 from core.models import Result
 from core.pipeline import process_batch
 from core.store import Store
@@ -32,9 +32,9 @@ from core.tabular import (
 )
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-UPLOAD_DIR = os.path.join(ROOT, ".uploads")
+UPLOAD_DIR = os.getenv("FINDER_UPLOAD_DIR") or os.path.join(ROOT, ".uploads")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-RUNS_DB = os.path.join(ROOT, ".runs.db")
+RUNS_DB = os.path.join(data_dir(), ".runs.db")
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -87,7 +87,9 @@ class PlanRequest(BaseModel):
     company_col: str
     country_col: str | None = None
     product_col: str | None = None
+    address_col: str | None = None
     dedupe: bool = True
+    fuzzy: bool = False
     limit: int | None = None
     product_override: str | None = None
 
@@ -102,7 +104,11 @@ class RunRequest(PlanRequest):
     use_cache: bool = True
     guess_emails: bool = True
     early_exit: bool = True
+    merge_sources: bool = False
     insecure_tls: bool = False
+    use_company_store: bool = True
+    search_provider: str = "ddg"
+    searxng_url: str | None = None
 
 
 # --- Helpers ---------------------------------------------------------------
@@ -135,7 +141,9 @@ def _plan(req: PlanRequest):
         company_col=req.company_col,
         country_col=req.country_col,
         product_col=req.product_col,
+        address_col=req.address_col,
         dedupe=req.dedupe,
+        fuzzy=req.fuzzy,
         limit=req.limit,
         product_override=_split_terms(req.product_override),
     )
@@ -143,7 +151,7 @@ def _plan(req: PlanRequest):
 
 
 def _config_from(req: RunRequest) -> Config:
-    return Config(
+    cfg = Config(
         max_threads_companies=max(1, min(req.threads, 20)),
         max_pages=max(1, min(req.max_pages, 30)),
         top_results=max(1, min(req.top_results, 8)),
@@ -152,8 +160,14 @@ def _config_from(req: RunRequest) -> Config:
         use_cache=req.use_cache,
         guess_emails=req.guess_emails,
         early_exit=req.early_exit,
+        merge_sources=req.merge_sources,
         insecure_tls=req.insecure_tls,
+        use_company_store=req.use_company_store,
+        search_provider=req.search_provider or "ddg",
     )
+    if req.searxng_url:
+        cfg.searxng_url = req.searxng_url
+    return cfg
 
 
 RESULT_COLUMNS = [
@@ -163,7 +177,9 @@ RESULT_COLUMNS = [
     ("phones", "Phones"), ("whatsapp_numbers", "WhatsApp"),
     ("social_links", "Social"), ("match_reason", "Why matched"),
     ("products", "Products"), ("pages_scanned", "Pages scanned"),
-    ("alternates", "Other candidates"), ("elapsed", "Seconds"),
+    ("address", "Address"), ("address_confirmed", "Address confirmed"),
+    ("sources", "Sites scraped"), ("alternates", "Other candidates"),
+    ("elapsed", "Seconds"),
 ]
 
 
@@ -285,7 +301,8 @@ async def start_run(req: RunRequest):
 
         try:
             await process_batch(
-                [j.as_row() for j in jobs], config, on_event=on_event, cache=cache
+                [j.as_row() for j in jobs], config,
+                on_event=on_event, cache=cache, store=store,
             )
             elapsed = time.perf_counter() - started
             store.finish_run(run_id, "done", elapsed)
@@ -411,9 +428,21 @@ async def unsupported_handler(_request, exc: UnsupportedFile):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
-def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
+def serve(host: str | None = None, port: int | None = None) -> None:
+    """Start the local server.
+
+    Defaults to 127.0.0.1 because there is no authentication. Inside a
+    container it must listen on 0.0.0.0 to be reachable at all — the compose
+    file publishes the port only to 127.0.0.1 on the host, which keeps the
+    same guarantee.
+    """
     import uvicorn
 
+    host = host or os.getenv("FINDER_HOST", "127.0.0.1")
+    port = int(port or os.getenv("FINDER_PORT", "8765"))
+
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"  ! Listening on {host} — this server has no authentication.")
     print(f"\n  B2B Contact Finder -> http://{host}:{port}\n")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 

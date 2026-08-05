@@ -15,7 +15,7 @@ website.
 
 ## Contents
 
-1. [Requirements and install](#1-requirements-and-install)
+1. [Install](#1-install)
 2. [Quick start](#2-quick-start)
 3. [Web UI walkthrough](#3-web-ui-walkthrough)
 4. [Working with a raw Excel export](#4-working-with-a-raw-excel-export)
@@ -24,18 +24,78 @@ website.
 7. [How it works](#7-how-it-works)
 8. [Where to change things](#8-where-to-change-things)
 9. [Troubleshooting](#9-troubleshooting)
-10. [Measured results](#10-measured-results)
+10. [Search backends](#10-search-backends)
+11. [Company name normalisation](#11-company-name-normalisation)
+12. [The company store](#12-the-company-store)
+13. [Using the address column](#13-using-the-address-column)
+14. [Measured results](#14-measured-results)
 
 ---
 
-## 1. Requirements and install
+## 1. Install
+
+### Fastest path
+
+**Linux / macOS**
+
+```bash
+./install.sh
+```
+
+**Windows** (PowerShell)
+
+```powershell
+.\install.ps1
+```
+
+The installer picks Docker if it is running, otherwise a local Python venv.
+Force either with `./install.sh docker` or `./install.sh native`.
+
+### What each mode gives you
+
+| | Docker | Native venv |
+|---|---|---|
+| Search backend | self-hosted **SearXNG** (federates Google/Bing/Brave) | DuckDuckGo |
+| Parallel searches | 16 | 6 |
+| API key | none | none |
+| Python needed | no | 3.10+ |
+| Start | `make up` | `make web` |
+
+Docker is worth it for large files: DuckDuckGo throttles at about six
+concurrent queries, and that ceiling — not the worker count — is what limits a
+2000-company run.
+
+### Docker by hand
+
+```bash
+./install.sh docker     # generates .env with a SearXNG secret, then builds
+make logs               # follow along
+make down               # stop
+make rebuild            # after changing code
+```
+
+Compose starts two containers: the app and SearXNG. The app is published on
+`127.0.0.1:8765` only — the UI has **no authentication**, so it must not be
+reachable from the network. SearXNG is not published at all; only the app
+container talks to it. Uncomment its `ports:` block if you want to search by
+hand at `http://127.0.0.1:8080`.
+
+Data (caches, run history, uploads) lives in named volumes and survives a
+rebuild. `docker compose down -v` deletes it.
+
+Compose deliberately has **no default** for `SEARXNG_SECRET` — running it
+without `.env` fails immediately rather than starting every install with the
+same publicly-known secret.
+
+### Native install
 
 - Python 3.10 or newer (uses `str | None` syntax)
 - An internet connection
 - No API key of any kind
 
 ```bash
-make install
+make install     # same as ./install.sh native
+make web
 ```
 
 That creates `venv/` and installs everything in `requirements.txt`:
@@ -81,7 +141,9 @@ make batch IN=data.xlsx ARGS='--csv-column "Tên Cty nhập khẩu" --country-co
 ## 3. Web UI walkthrough
 
 The interface is in **English and Vietnamese** — toggle `EN`/`VI` in the header,
-English by default, the choice is remembered in your browser.
+English by default. Next to it, the 🌗 button cycles the theme through
+**auto → light → dark**; auto follows your operating system. Both choices are
+remembered in your browser.
 
 **Step 1 — Choose a raw data file.** Drag in a `.xlsx`, `.xlsm` or `.csv`
 (up to 64 MB). The file is stored under `.uploads/` and parsed immediately.
@@ -115,10 +177,17 @@ along with the first few names, so you can confirm the mapping before starting.
 | Delay (seconds) | 0 | minimum gap between requests to the same host |
 | Cache | on | reuse the local SQLite cache |
 | Guess emails | on | generate `info@`/`sales@` when nothing is found |
+| Merge all candidates | off | scrape every qualifying site and merge, instead of stopping at the first that yields something |
+| Company store | on | reuse a result already found for the same company |
+| Search backend | DuckDuckGo | DuckDuckGo, SearXNG (self-hosted), Brave or Serper |
 | Skip TLS check | off | only for TLS-inspecting proxies — see section 9 |
 
 **Step 3 — Results.** Rows stream in as each company finishes. Sort by score,
-filter by text, or tick *Only rows with contacts*. Export to CSV or Excel.
+filter by text, or tick *Only rows with contacts*. The table is paged (25/50/100
+or all) so a 400-company run stays readable; changing the filter or page size
+returns to page 1, but rows arriving during a live run leave your page alone.
+Export to CSV or Excel — the download always contains the **whole** run, not
+the page on screen.
 **Stop** cancels a run in progress; results already found are kept.
 
 **History** (header button) lists every past run with its status and timing.
@@ -219,6 +288,13 @@ not silently searched for as a company name.
 | `--no-cache` | off | bypass the SQLite cache entirely |
 | `--no-guess` | off | do not generate `info@`/`sales@` fallbacks |
 | `--no-early-exit` | off | keep scanning even after contacts are found |
+| `--merge-sources` | off | scan every candidate above `--min-score` and merge their contacts |
+| `--address TEXT` | — | postal address of the target company (single lookup) |
+| `--address-column NAME` | `address` | column holding the address |
+| `--fuzzy-dedupe` | off | also merge near-identical names (see the warning below) |
+| `--no-company-store` | off | do not reuse or record results in the company table |
+| `--search-provider NAME` | `ddg` | `ddg`, `searxng`, `brave` or `serper` |
+| `--searxng-url URL` | `http://127.0.0.1:8080` | base URL of your SearXNG instance |
 | `--insecure-tls` | off | skip TLS verification (see section 9) |
 | `--out PATH` | — | write results to a CSV |
 | `--json` | off | print results as JSON instead of a human summary |
@@ -267,6 +343,9 @@ not silently searched for as a company name.
 | `whatsapp_numbers` | taken from real `wa.me`/`api.whatsapp.com` links only |
 | `social_links` | profile URLs; share buttons and bare platform roots are filtered out |
 | `pages_scanned` | exactly which URLs were read |
+| `address` | the address supplied for this company |
+| `address_confirmed` | `yes` when the scanned site names the company's own city |
+| `sources` | the sites actually scraped, as `score url` — more than one in merge mode |
 | `alternates` | runner-up candidates as `score url`, for manual checking |
 | `notes` | snippets used, skipped listing pages, off-domain emails that were dropped |
 | `elapsed` | seconds spent on this company |
@@ -306,8 +385,27 @@ name + country + products
         └─ 6. if still empty, guess + MX check    core/extract.py
 ```
 
-Runner-up candidates are only visited if the best one yields nothing, and get a
-third of the page budget.
+### One site or several
+
+By default only the **best** candidate is scraped in full. Runner-ups are
+visited only if it yields nothing, and get a third of the page budget. This is
+why "Candidates per company: 3" usually results in one site being read — 3 is a
+ceiling, not a target.
+
+`--merge-sources` (UI: *Merge all candidates*) changes that: every candidate
+above `--min-score` is scraped with the full page budget and their contacts are
+pooled. Two extra rules keep it honest:
+
+- Candidates are deduplicated by registrable domain first, so three pages of
+  one site count as one source.
+- A secondary domain is only merged if its name resembles the company
+  (similarity ≥ 45). Listings sites clear the score threshold on country and
+  product alone, and scraping one hands back its own support inbox as the
+  company's — there are far too many to blacklist by hand. Skipped domains are
+  logged in `notes`.
+
+Expect roughly one extra source per company and a longer run. Use it when
+coverage matters more than speed.
 
 ### Scoring
 
@@ -462,7 +560,151 @@ rows with contacts and fewer wrong ones.
 
 ---
 
-## 10. Measured results
+## 10. Search backends
+
+DuckDuckGo is the default and needs nothing installed, but it is scraped rather
+than API-served: it throttles at about six concurrent queries, occasionally
+fails, and returns slightly different results between runs. That ceiling — not
+the worker count — is what limits throughput on a large file.
+
+| Backend | Setup | Concurrency | Cost |
+|---|---|---|---|
+| `ddg` | none | 6 | free |
+| `searxng` | self-host, see below | 16 | free |
+| `brave` | `FINDER_SEARCH_API_KEY` | 10 | per query |
+| `serper` | `FINDER_SEARCH_API_KEY` | 10 | per query |
+
+### SearXNG (recommended for large files)
+
+SearXNG is a self-hosted metasearch engine. It federates Google, Bing, Brave
+and others behind one endpoint, so recall is better than DuckDuckGo alone,
+there is no API key and no per-query cost, and the rate limit is yours to set.
+
+The supplied `docker-compose.yml` sets it up for you — `./install.sh docker`
+is all you need. `searxng/settings.yml` in this repo already enables the JSON
+API, disables the rate limiter (it would throttle your own batch runs), and
+tightens the outgoing timeouts.
+
+To run SearXNG yourself instead:
+
+```bash
+docker run -d --name searxng -p 8080:8080 \
+  -v "$PWD/searxng:/etc/searxng" \
+  -e SEARXNG_SECRET="$(openssl rand -hex 32)" \
+  searxng/searxng
+```
+
+**Its JSON API is off by default** — that is the single most common setup
+mistake. Without this in `settings.yml` the tool reports that SearXNG returned
+HTML rather than JSON:
+
+```yaml
+search:
+  formats:
+    - html
+    - json
+```
+
+Point a native install at it with:
+
+```bash
+./venv/bin/python3 main.py data.xlsx --search-provider searxng
+# or persistently
+export FINDER_SEARCH_PROVIDER=searxng
+export FINDER_SEARXNG_URL=http://127.0.0.1:8080
+```
+
+A configured backend that cannot be reached **aborts the run with an error**
+rather than reporting every company as having no web presence. DuckDuckGo stays
+lenient, because it flakes on individual queries and aborting a whole batch for
+one failed query would be worse.
+
+---
+
+## 11. Company name normalisation
+
+A customs export spells the same importer several ways. Before deduplication,
+names are reduced to a normalised identity — case, whitespace, punctuation and
+legal suffixes removed, dotted initials rejoined:
+
+```
+MCCORMICK GLOBAL INGREDIENTS LIMITED   ┐
+MC CORMICK GLOBAL INGREDIENTS LIMITED  ├─> mccormickglobalingredients
+MCCORMICK GLOBAL INGREDIENTS LTD.      │
+McCormick Global Ingredients Limited   ┘
+```
+
+On a real 1007-row file this merged 427 raw names into **408 companies** across
+18 groups, every one of them an exact match after normalisation.
+
+Two distinctions matter:
+
+- **Legal forms** (`ltd`, `llc`, `pvt`, `b.v.`) are dropped when deciding
+  identity — `X Ltd` and `X Limited` are the same company.
+- **Descriptors** (`global`, `international`, `trading`, `exports`) are *not*.
+  They are dropped only when matching a name against a domain. Dropping them
+  from identity would merge `FRESHDRINKUS LLC` with `FRESHDRINKUS GLOBAL LLC`,
+  which may be separate legal entities.
+
+### Why `--fuzzy-dedupe` is off
+
+Edit-distance matching cannot be made safe on this data. Measured on the real
+file:
+
+| Pair | Score | Wanted |
+|---|---|---|
+| `VINAY ENTERPRISES` vs `VINAYAK ENTERPRISES` | 94 | keep separate |
+| `FRESHDRINKUS GLOBAL LLC` vs `...LCC` (typo) | 92 | merge |
+
+The wrong merge outranks the right one, so no threshold separates them. Known
+misspellings are handled as exact tokens in `LEGAL_TOKENS` instead. Every merge
+worth having already scores 100 after normalisation.
+
+---
+
+## 12. The company store
+
+Results are written to a `companies` table in `.runs.db`, keyed by normalised
+name. Re-running a file, or running a different file containing the same
+importer, becomes a database read:
+
+```
+first lookup of RIDDHI SIDDHI IMPEX    26.0s
+same company, second run                0.2s   (note: "from company store")
+```
+
+It matches across spellings — a run for `RIDDHI SIDDHI IMPEX.` hits the entry
+stored for `RIDDHI SIDDHI IMPEX`. Entries expire after 90 days
+(`Config.company_ttl`), on the assumption that contact details drift slowly.
+`--no-company-store` bypasses it entirely.
+
+This is separate from the HTTP/search cache in `.cache.db`, which has a
+one-week TTL and works at the URL level.
+
+---
+
+## 13. Using the address column
+
+If your export has an importer address column, map it — it is the sharpest
+disambiguator available for generic company names.
+
+The full address is never used as a search term; no page contains it verbatim.
+Instead the **city** is extracted and used two ways: as one query variant, and
+as a scoring signal worth 14 points when it appears on a candidate page. When
+the scanned site names the company's own city, `address_confirmed` is set.
+
+Locality extraction handles the common formats, including postcodes that
+precede the city:
+
+```
+123 Main St, Mathura, Uttar Pradesh 281001, India  ->  Mathura, Uttar Pradesh
+Kruisweg 855, 2132 NG Hoofddorp, Netherlands       ->  Hoofddorp
+Unit 5, 12 Baker Street, London SW1A 1AA, UK       ->  London
+```
+
+---
+
+## 14. Measured results
 
 Two comparisons against the original implementation (git `d4d9ede`), same
 machine, same day, same inputs.

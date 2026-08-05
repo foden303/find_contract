@@ -38,10 +38,14 @@ class ScanJob:
     company: str
     country: str | None = None
     products: list[str] = field(default_factory=list)
+    address: str | None = None
     occurrences: int = 1
+    # Every raw spelling this job was built from, so results can be joined
+    # back onto the original shipment rows.
+    variants: list[str] = field(default_factory=list)
 
-    def as_row(self) -> tuple[str, str | None, list[str]]:
-        return (self.company, self.country, self.products)
+    def as_row(self) -> tuple[str, str | None, list[str], str | None]:
+        return (self.company, self.country, self.products, self.address)
 
 
 class UnsupportedFile(ValueError):
@@ -153,6 +157,11 @@ _PRODUCT_HINTS = [
     "tên hàng", "mặt hàng", "sản phẩm", "product", "goods",
     "description", "commodity", "item", "hs code",
 ]
+_ADDRESS_HINTS = [
+    "địa chỉ cty nhập khẩu", "địa chỉ công ty nhập khẩu", "địa chỉ nhập khẩu",
+    "importer address", "consignee address", "buyer address",
+    "địa chỉ", "address", "dia chi", "location", "street",
+]
 
 
 def _guess(headers: list[str], hints: list[str]) -> str | None:
@@ -172,7 +181,105 @@ def guess_columns(headers: list[str]) -> dict[str, str | None]:
         "company": _guess(headers, _COMPANY_HINTS),
         "country": _guess(headers, _COUNTRY_HINTS),
         "product": _guess(headers, _PRODUCT_HINTS),
+        "address": _guess(headers, _ADDRESS_HINTS),
     }
+
+
+# --- Company name normalisation --------------------------------------------
+
+# Two normalised names this similar are treated as the same company.
+FUZZY_THRESHOLD = 92
+# Only compare names sharing this prefix, so large files stay linear-ish
+_BLOCK_CHARS = 3
+
+
+def dedupe_key(name: str) -> str:
+    """Normalised identity of a company name.
+
+    Collapses case, whitespace, punctuation and legal suffixes, so
+    "MC CORMICK GLOBAL INGREDIENTS LIMITED", "MCCORMICK ... LTD." and
+    "McCormick Global Ingredients Limited" all land on one key.
+    """
+    from core.scoring import normalize_company
+
+    compact, _ = normalize_company(name, strict=True)
+    return compact or " ".join((name or "").lower().split())
+
+
+def cluster_keys(keys: list[str], threshold: int = FUZZY_THRESHOLD) -> dict[str, str]:
+    """Map each key to a canonical key, merging near-identical spellings.
+
+    Exact normalisation already handles most of it; this catches the leftovers
+    (a dropped letter, a joined word). Keys are blocked by their first few
+    characters so this does not become quadratic over the whole file.
+    """
+    from rapidfuzz import fuzz
+
+    canonical: dict[str, str] = {}
+    blocks: dict[str, list[str]] = {}
+    # Longest first: the fuller spelling makes the better canonical form
+    for key in sorted(set(keys), key=lambda k: (-len(k), k)):
+        block = blocks.setdefault(key[:_BLOCK_CHARS], [])
+        match = next(
+            (seen for seen in block if fuzz.ratio(key, seen) >= threshold), None
+        )
+        if match:
+            canonical[key] = canonical[match]
+        else:
+            canonical[key] = key
+            block.append(key)
+    return canonical
+
+
+# --- Address ----------------------------------------------------------------
+
+# Postcodes sit before the city in some countries (NL "2132 NG Hoofddorp") and
+# after it in others, so they are stripped wherever they appear, not just at
+# the end of a segment.
+_POSTCODE_RES = [
+    re.compile(r"\b\d{4}\s?[A-Z]{2}\b"),                        # NL
+    re.compile(r"\b[A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2}\b"),    # UK
+    re.compile(r"\b\d{5}(?:-\d{4})?\b"),                        # US, DE, VN
+    re.compile(r"\b\d{6}\b"),                                   # IN, CN, SG
+    re.compile(r"\b\d{4}\b"),                                   # AU, AT, BE…
+]
+
+
+def extract_locality(address: str, country: str | None = None) -> str:
+    """Reduce a full postal address to the city (and region) worth searching.
+
+    A whole address is useless as a search term — no page contains it verbatim.
+    The city is what disambiguates two companies with the same name.
+    """
+    from core.utils import region_for_country
+
+    if not address:
+        return ""
+
+    # Strip postcodes before anything else, so "London SW1A 1AA" becomes plain
+    # "London" and is no longer mistaken for a street line.
+    keep: list[str] = []
+    for part in re.split(r"[,\n;|]+", address):
+        for pattern in _POSTCODE_RES:
+            part = pattern.sub(" ", part)
+        part = re.sub(r"\s{2,}", " ", part).strip(" ,-.")
+        if not part or re.fullmatch(r"[\d\s\-/.]+", part):
+            continue
+        if region_for_country(part):                   # the country itself
+            continue
+        if country and part.lower() == country.strip().lower():
+            continue
+        keep.append(part)
+
+    # Whatever still carries a number at the front of the address is a street
+    # line: "Unit 5", "12 Baker Street", "Kruisweg 855".
+    while len(keep) > 1 and re.search(r"\d", keep[0]):
+        keep = keep[1:]
+    if not keep or re.search(r"\d", keep[0]) and len(keep) == 1:
+        return ""
+
+    # City then region is the useful tail of most address formats
+    return ", ".join(keep[-2:])
 
 
 # --- Product terms ---------------------------------------------------------
@@ -207,7 +314,9 @@ def build_jobs(
     company_col: str,
     country_col: str | None = None,
     product_col: str | None = None,
+    address_col: str | None = None,
     dedupe: bool = True,
+    fuzzy: bool = False,
     limit: int | None = None,
     max_products: int = 3,
     product_override: list[str] | None = None,
@@ -217,6 +326,16 @@ def build_jobs(
     `product_override` replaces the per-row product terms entirely — useful
     when the sheet's description column is in another language and you know
     the English keywords for the whole file.
+
+    Normalisation alone merges "MC CORMICK ... LIMITED", "MCCORMICK ... LTD."
+    and "McCormick Global Ingredients Limited" into one lookup.
+
+    `fuzzy` additionally merges near-identical keys by edit distance. It is off
+    by default because it cannot be made safe: on real customs data
+    "VINAY ENTERPRISES" vs "VINAYAK ENTERPRISES" (different companies) scores
+    94, while "FRESHDRINKUS GLOBAL LLC" vs "...LCC" (a typo, same company)
+    scores 92 — the wrong merge outranks the right one. Known misspellings are
+    handled in LEGAL_TOKENS instead, which is exact.
     """
     if company_col not in headers:
         raise ValueError(f"Column not found: {company_col}")
@@ -224,6 +343,7 @@ def build_jobs(
     ci = headers.index(company_col)
     coi = headers.index(country_col) if country_col in headers else None
     pi = headers.index(product_col) if product_col in headers else None
+    ai = headers.index(address_col) if address_col in headers else None
 
     def at(row: list[str], index: int | None) -> str:
         if index is None or index >= len(row):
@@ -248,18 +368,30 @@ def build_jobs(
                 company=company,
                 country=at(row, coi) or None,
                 products=products_for(at(row, pi)),
+                address=at(row, ai) or None,
+                variants=[company],
             ))
         return jobs[:limit] if limit else jobs
+
+    # Normalised identity first, then optionally merge near-identical keys.
+    raw_keys = {}
+    for row in rows:
+        company = at(row, ci)
+        if company and company not in raw_keys:
+            raw_keys[company] = dedupe_key(company)
+    canonical = cluster_keys(list(raw_keys.values())) if fuzzy else {}
 
     grouped: "OrderedDict[str, dict]" = OrderedDict()
     for row in rows:
         company = at(row, ci)
         if not company:
             continue
-        key = " ".join(company.lower().split())
+        key = raw_keys[company]
+        key = canonical.get(key, key)
         bucket = grouped.setdefault(
             key,
-            {"name": Counter(), "country": Counter(), "products": Counter(), "count": 0},
+            {"name": Counter(), "country": Counter(), "products": Counter(),
+             "address": Counter(), "count": 0},
         )
         bucket["count"] += 1
         bucket["name"][company] += 1
@@ -269,6 +401,9 @@ def build_jobs(
         product = sanitize_product(at(row, pi))
         if product:
             bucket["products"][product] += 1
+        address = at(row, ai)
+        if address:
+            bucket["address"][address] += 1
 
     jobs = []
     for bucket in grouped.values():
@@ -283,7 +418,9 @@ def build_jobs(
             company=bucket["name"].most_common(1)[0][0],
             country=(bucket["country"].most_common(1)[0][0] if bucket["country"] else None),
             products=products,
+            address=(bucket["address"].most_common(1)[0][0] if bucket["address"] else None),
             occurrences=bucket["count"],
+            variants=[n for n, _ in bucket["name"].most_common()],
         ))
 
     # Frequent trading partners first — they are the leads worth having
@@ -294,7 +431,8 @@ def build_jobs(
 def jobs_to_csv(jobs: list[ScanJob]) -> str:
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["company", "country", "product", "occurrences"])
+    writer.writerow(["company", "country", "product", "address", "occurrences", "variants"])
     for job in jobs:
-        writer.writerow([job.company, job.country or "", ", ".join(job.products), job.occurrences])
+        writer.writerow([job.company, job.country or "", ", ".join(job.products),
+                         job.address or "", job.occurrences, " | ".join(job.variants)])
     return buf.getvalue()

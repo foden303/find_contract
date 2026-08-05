@@ -21,6 +21,7 @@ class Result:
     company: str | None = None
     country: str | None = None
     products: list[str] = field(default_factory=list)
+    address: str | None = None
     website: str | None = None
     pages_scanned: list[str] = field(default_factory=list)
     emails: list[str] = field(default_factory=list)
@@ -41,6 +42,10 @@ class Result:
     match_reason: list[str] = field(default_factory=list)
     # Other candidates we considered, best-first: "score url"
     alternates: list[str] = field(default_factory=list)
+    # Sites actually scraped, "score url" — more than one in merge mode
+    sources: list[str] = field(default_factory=list)
+    # The scanned site actually mentions the company's city: strong evidence
+    address_confirmed: bool = False
     elapsed: float = 0.0
 
     @property

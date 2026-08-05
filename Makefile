@@ -8,11 +8,18 @@ IN ?= companies.csv
 PORT ?= 8765
 TOP ?= 3
 
-.PHONY: help install web run keyword batch clean clean-cache
+.PHONY: help install web run keyword batch clean clean-cache up down logs rebuild
 
 help:
 	@echo "  make install            - create the venv and install dependencies"
 	@echo "  make web [PORT=8765]    - open the local web UI (pick an Excel file in the browser)"
+	@echo ""
+	@echo "  Docker (app + self-hosted SearXNG, no API key):"
+	@echo "  make up                 - build and start everything"
+	@echo "  make down               - stop it"
+	@echo "  make logs               - follow the logs"
+	@echo "  make rebuild            - rebuild after a code change"
+	@echo ""
 	@echo "  make run QUERY=\"...\"    - look up one company or domain"
 	@echo "  make keyword Q=\"...\"    - discover new leads from a product keyword"
 	@echo "  make batch [IN=file]    - process a .csv or .xlsx file"
@@ -50,6 +57,22 @@ batch:
 		$(PYTHON) main.py "$(IN)" --top-results $(TOP) \
 			--out results_$(shell date +%Y%m%d_%H%M%S).csv $(ARGS); \
 	fi
+
+# --- Docker ------------------------------------------------------------------
+# `up` runs the installer first so .env (and its SearXNG secret) always exists;
+# compose refuses to start without it rather than using a shared default.
+
+up:
+	@./install.sh docker
+
+down:
+	docker compose down
+
+logs:
+	docker compose logs -f
+
+rebuild:
+	docker compose up -d --build
 
 clean-cache:
 	rm -f .cache.db .cache.db-wal .cache.db-shm

@@ -5,17 +5,33 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>B2B Contact Finder</title>
 <style>
+  /* Light is the base. Dark arrives either from the OS (when the user has not
+     chosen explicitly) or from an explicit data-theme="dark" on <html>. */
   :root {
     --bg: #f6f7f9; --panel: #fff; --ink: #16181d; --muted: #6b7280;
     --line: #e3e6ea; --accent: #2563eb; --accent-ink: #fff;
     --ok: #15803d; --warn: #b45309; --bad: #b91c1c; --chip: #eef2f7;
+    color-scheme: light;
   }
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       --bg: #14161a; --panel: #1c1f25; --ink: #e8eaed; --muted: #9aa3af;
       --line: #2c313a; --accent: #4f86f7; --chip: #262b33;
       --ok: #4ade80; --warn: #fbbf24; --bad: #f87171;
+      color-scheme: dark;
     }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14161a; --panel: #1c1f25; --ink: #e8eaed; --muted: #9aa3af;
+    --line: #2c313a; --accent: #4f86f7; --chip: #262b33;
+    --ok: #4ade80; --warn: #fbbf24; --bad: #f87171;
+    color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --bg: #f6f7f9; --panel: #fff; --ink: #16181d; --muted: #6b7280;
+    --line: #e3e6ea; --accent: #2563eb; --accent-ink: #fff;
+    --ok: #15803d; --warn: #b45309; --bad: #b91c1c; --chip: #eef2f7;
+    color-scheme: light;
   }
   * { box-sizing: border-box; }
   body {
@@ -106,6 +122,7 @@
     <button id="lang-en" data-lang="en">EN</button>
     <button id="lang-vi" data-lang="vi">VI</button>
   </div>
+  <button id="btn-theme" data-i18n-title="theme.hint" title="Theme">🌗</button>
   <button id="btn-history" data-i18n="nav.history">History</button>
 </header>
 
@@ -143,6 +160,10 @@
       <div>
         <label data-i18n="s2.product">Product column</label>
         <select id="col-product"></select>
+      </div>
+      <div>
+        <label data-i18n="s2.address">Address column</label>
+        <select id="col-address"></select>
       </div>
     </div>
 
@@ -186,12 +207,31 @@
         <div><label data-i18n="adv.delay">Delay (seconds)</label>
           <input type="number" id="delay" value="0" min="0" step="0.1"></div>
         <div>
+          <label data-i18n="adv.provider">Search backend</label>
+          <select id="provider">
+            <option value="ddg">DuckDuckGo</option>
+            <option value="searxng">SearXNG (self-hosted)</option>
+            <option value="brave">Brave API</option>
+            <option value="serper">Serper API</option>
+          </select>
+          <input type="text" id="searxurl" style="margin-top:4px;display:none"
+                 placeholder="http://127.0.0.1:8080">
+        </div>
+        <div>
           <label data-i18n="adv.other">Other</label>
           <div style="font-size:12px">
             <label class="inline"><input type="checkbox" id="usecache" checked>
               <span data-i18n="adv.cache">Cache</span></label>
             <label class="inline"><input type="checkbox" id="guess" checked>
               <span data-i18n="adv.guess">Guess emails</span></label>
+            <label class="inline" data-i18n-title="adv.merge.hint"
+                   title="Scan every candidate above the minimum score and merge their contacts">
+              <input type="checkbox" id="merge">
+              <span data-i18n="adv.merge">Merge all candidates</span></label>
+            <label class="inline" data-i18n-title="adv.store.hint"
+                   title="Reuse results already found for the same company">
+              <input type="checkbox" id="store" checked>
+              <span data-i18n="adv.store">Company store</span></label>
             <label class="inline" data-i18n-title="adv.tls.hint"
                    title="Only enable behind a TLS-inspecting proxy">
               <input type="checkbox" id="insecure">
@@ -249,6 +289,23 @@
         <tbody></tbody>
       </table>
     </div>
+    <div class="row pager" style="margin-top:10px">
+      <button id="pg-first" title="First">«</button>
+      <button id="pg-prev" data-i18n="pg.prev">Previous</button>
+      <span id="pg-info" class="muted"></span>
+      <button id="pg-next" data-i18n="pg.next">Next</button>
+      <button id="pg-last" title="Last">»</button>
+      <span class="spacer" style="flex:1"></span>
+      <label class="inline">
+        <span class="muted" data-i18n="pg.perpage">Rows per page</span>
+        <select id="pg-size" style="width:auto">
+          <option>25</option>
+          <option selected>50</option>
+          <option>100</option>
+          <option value="0" data-i18n="pg.all">All</option>
+        </select>
+      </label>
+    </div>
   </section>
 
   <!-- HISTORY -->
@@ -271,7 +328,8 @@ const STRINGS = {
     's1.reading': 'Reading file…', 's1.rows': 'rows', 's1.cols': 'columns',
     's2.title': 'Pick the columns to look up', 's2.sheet': 'Sheet',
     's2.company': 'Company name column', 's2.country': 'Country column',
-    's2.product': 'Product column', 's2.none': '— not used —',
+    's2.product': 'Product column', 's2.address': 'Address column',
+    's2.none': '— not used —',
     's2.override': 'Shared product keywords (overrides the column, comma separated)',
     's2.override.ph': 'e.g. cinnamon, cassia, star anise',
     's2.limit': 'Limit number of companies (blank = all)', 's2.limit.ph': 'e.g. 50',
@@ -282,6 +340,14 @@ const STRINGS = {
     'adv.delay': 'Delay (seconds)', 'adv.other': 'Other', 'adv.cache': 'Cache',
     'adv.guess': 'Guess emails', 'adv.tls': 'Skip TLS check',
     'adv.tls.hint': 'Only enable behind a TLS-inspecting proxy',
+    'adv.merge': 'Merge all candidates',
+    'adv.merge.hint': 'Scan every candidate above the minimum score and merge their '
+                    + 'contacts, instead of stopping at the first site that yields something',
+    'adv.provider': 'Search backend', 'adv.store': 'Company store',
+    'adv.store.hint': 'Reuse results already found for the same company',
+    'theme.hint': 'Theme: auto → light → dark',
+    'theme.auto': 'Theme: auto (follows your system)',
+    'theme.light': 'Theme: light', 'theme.dark': 'Theme: dark',
     's3.title': 'Results', 's3.scanned': 'scanned', 's3.withcontact': 'with contacts',
     's3.emails': 'emails', 's3.elapsed': 'elapsed', 's3.stop': 'Stop',
     's3.csv': 'Download CSV', 's3.xlsx': 'Download Excel',
@@ -290,6 +356,8 @@ const STRINGS = {
     'col.keymail': 'Key emails', 'col.othermail': 'Other emails', 'col.phone': 'Phone',
     'col.whatsapp': 'WhatsApp', 'col.country': 'Country', 'col.why': 'Why matched',
     'col.secs': 'Secs',
+    'pg.prev': 'Previous', 'pg.next': 'Next', 'pg.perpage': 'Rows per page',
+    'pg.all': 'All', 'pg.info': '{from}–{to} of {total} · page {page}/{pages}',
     'hist.title': 'Run history', 'hist.when': 'When', 'hist.label': 'Label',
     'hist.source': 'Source', 'hist.status': 'Status', 'hist.done': 'Done',
     'hist.secs': 'Secs', 'hist.open': 'Open', 'hist.excel': 'Excel',
@@ -310,7 +378,8 @@ const STRINGS = {
     's1.reading': 'Đang đọc file…', 's1.rows': 'dòng', 's1.cols': 'cột',
     's2.title': 'Chọn cột cần tra cứu', 's2.sheet': 'Sheet',
     's2.company': 'Cột tên công ty', 's2.country': 'Cột quốc gia',
-    's2.product': 'Cột sản phẩm', 's2.none': '— không dùng —',
+    's2.product': 'Cột sản phẩm', 's2.address': 'Cột địa chỉ',
+    's2.none': '— không dùng —',
     's2.override': 'Từ khoá sản phẩm chung (ghi đè cột, cách nhau bằng dấu phẩy)',
     's2.override.ph': 'vd: cinnamon, cassia, star anise',
     's2.limit': 'Giới hạn số công ty (để trống = tất cả)', 's2.limit.ph': 'vd: 50',
@@ -321,6 +390,14 @@ const STRINGS = {
     'adv.delay': 'Giãn cách (giây)', 'adv.other': 'Khác', 'adv.cache': 'Cache',
     'adv.guess': 'Đoán email', 'adv.tls': 'Bỏ qua kiểm TLS',
     'adv.tls.hint': 'Chỉ bật khi máy nằm sau proxy chặn TLS',
+    'adv.merge': 'Gộp mọi ứng viên',
+    'adv.merge.hint': 'Quét tất cả ứng viên đạt điểm tối thiểu rồi gộp liên hệ, '
+                    + 'thay vì dừng ở website đầu tiên có kết quả',
+    'adv.provider': 'Nguồn tìm kiếm', 'adv.store': 'Kho công ty',
+    'adv.store.hint': 'Dùng lại kết quả đã tìm được cho cùng công ty',
+    'theme.hint': 'Giao diện: tự động → sáng → tối',
+    'theme.auto': 'Giao diện: tự động (theo hệ thống)',
+    'theme.light': 'Giao diện: sáng', 'theme.dark': 'Giao diện: tối',
     's3.title': 'Kết quả', 's3.scanned': 'đã quét', 's3.withcontact': 'có liên hệ',
     's3.emails': 'email', 's3.elapsed': 'thời gian', 's3.stop': 'Dừng',
     's3.csv': 'Tải CSV', 's3.xlsx': 'Tải Excel',
@@ -329,6 +406,8 @@ const STRINGS = {
     'col.keymail': 'Email chính', 'col.othermail': 'Email khác', 'col.phone': 'Điện thoại',
     'col.whatsapp': 'WhatsApp', 'col.country': 'Nước', 'col.why': 'Vì sao khớp',
     'col.secs': 'Giây',
+    'pg.prev': 'Trước', 'pg.next': 'Sau', 'pg.perpage': 'Dòng mỗi trang',
+    'pg.all': 'Tất cả', 'pg.info': '{from}–{to} / {total} · trang {page}/{pages}',
     'hist.title': 'Lịch sử chạy', 'hist.when': 'Thời điểm', 'hist.label': 'Nhãn',
     'hist.source': 'Nguồn', 'hist.status': 'Trạng thái', 'hist.done': 'Xong',
     'hist.secs': 'Giây', 'hist.open': 'Mở', 'hist.excel': 'Excel',
@@ -370,14 +449,36 @@ function applyLang() {
   if (!$('s-history').hidden) loadHistory();
   if (state.fileMeta) showFileInfo(state.fileMeta);
   if (state.plan) showPlan(state.plan);
+  // The theme button's tooltip is language-dependent and state-dependent, so
+  // it has to be rewritten after the generic data-i18n-title pass above.
+  applyTheme();
 }
 
 document.querySelectorAll('.lang button').forEach(b => {
   b.onclick = () => { LANG = b.dataset.lang; localStorage.setItem('finder-lang', LANG); applyLang(); };
 });
 
+// ---------- theme ----------
+// auto -> follow the OS, light, dark. Stored so the choice survives a reload.
+const THEMES = ['auto', 'light', 'dark'];
+const THEME_ICON = { auto: '🌗', light: '☀️', dark: '🌙' };
+let THEME = localStorage.getItem('finder-theme') || 'auto';
+
+function applyTheme() {
+  if (THEME === 'auto') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', THEME);
+  $('btn-theme').textContent = THEME_ICON[THEME];
+  $('btn-theme').title = t('theme.' + THEME);
+}
+
+$('btn-theme').onclick = () => {
+  THEME = THEMES[(THEMES.indexOf(THEME) + 1) % THEMES.length];
+  localStorage.setItem('finder-theme', THEME);
+  applyTheme();
+};
+
 const state = { fileId: null, headers: [], sheets: [], runId: null, es: null,
-                results: [], sortKey: 'confidence', sortDir: -1, startedAt: 0,
+                results: [], sortKey: 'confidence', sortDir: -1, startedAt: 0, page: 1,
                 timer: null, sample: [], fileMeta: null, plan: null, mapping: {} };
 
 // ---------- upload ----------
@@ -429,11 +530,12 @@ function rebuildColumnSelects() {
     state.headers.map(h => `<option value="${esc(h)}">${esc(h)}</option>`).join('');
   const keep = {
     company: $('col-company').value, country: $('col-country').value,
-    product: $('col-product').value,
+    product: $('col-product').value, address: $('col-address').value,
   };
   $('col-company').innerHTML = opts(false);
   $('col-country').innerHTML = opts(true);
   $('col-product').innerHTML = opts(true);
+  $('col-address').innerHTML = opts(true);
   const pick = (id, kept, guessed) => {
     const value = kept || guessed || '';
     if (value && state.headers.includes(value)) $(id).value = value;
@@ -441,6 +543,7 @@ function rebuildColumnSelects() {
   pick('col-company', keep.company, state.mapping.company);
   pick('col-country', keep.country, state.mapping.country);
   pick('col-product', keep.product, state.mapping.product);
+  pick('col-address', keep.address, state.mapping.address);
 }
 
 function applyTable(data) {
@@ -486,6 +589,7 @@ function planBody() {
     company_col: $('col-company').value,
     country_col: $('col-country').value || null,
     product_col: $('col-product').value || null,
+    address_col: $('col-address').value || null,
     dedupe: $('dedupe').checked,
     limit: Number.isFinite(limit) && limit > 0 ? limit : null,
     product_override: $('override').value || null,
@@ -494,7 +598,7 @@ function planBody() {
 
 let planTimer = null;
 function refreshPlan() { clearTimeout(planTimer); planTimer = setTimeout(doPlan, 250); }
-['col-company','col-country','col-product','dedupe','limit','override']
+['col-company','col-country','col-product','col-address','dedupe','limit','override']
   .forEach(id => { $(id).oninput = refreshPlan; $(id).onchange = refreshPlan; });
 
 function showPlan(data) {
@@ -527,6 +631,9 @@ $('btn-run').onclick = async () => {
     top_results: +$('topres').value, min_score: +$('minscore').value,
     delay: +$('delay').value, use_cache: $('usecache').checked,
     guess_emails: $('guess').checked, insecure_tls: $('insecure').checked,
+    merge_sources: $('merge').checked, use_company_store: $('store').checked,
+    search_provider: $('provider').value,
+    searxng_url: $('searxurl').value || null,
   });
   const res = await fetch('/api/run', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -537,6 +644,7 @@ $('btn-run').onclick = async () => {
 
   state.runId = data.run_id;
   state.results = [];
+  state.page = 1;
   state.startedAt = Date.now();
   $('s-run').hidden = false;
   $('s-history').hidden = true;
@@ -591,15 +699,49 @@ document.querySelectorAll('#results th.sortable').forEach(th => {
     renderResults();
   };
 });
-$('filter').oninput = renderResults;
-$('only-hit').onchange = renderResults;
+$('provider').onchange = () => {
+  $('searxurl').style.display = $('provider').value === 'searxng' ? '' : 'none';
+};
+// Changing what is shown restarts at page 1; arriving results do not, so a
+// live run does not yank the page out from under whoever is reading it.
+const rerenderFromFirstPage = () => { state.page = 1; renderResults(); };
+$('filter').oninput = rerenderFromFirstPage;
+$('only-hit').onchange = rerenderFromFirstPage;
+$('pg-size').onchange = rerenderFromFirstPage;
 
-function renderResults() {
+$('pg-first').onclick = () => { state.page = 1; renderResults(); };
+$('pg-prev').onclick = () => { state.page--; renderResults(); };
+$('pg-next').onclick = () => { state.page++; renderResults(); };
+$('pg-last').onclick = () => { state.page = Infinity; renderResults(); };
+
+function visibleRows() {
   const q = $('filter').value.toLowerCase().trim();
   let rows = state.results.slice();
   if ($('only-hit').checked) rows = rows.filter(hasContact);
   if (q) rows = rows.filter(r => JSON.stringify(r).toLowerCase().includes(q));
   rows.sort((a, b) => (a[state.sortKey] - b[state.sortKey]) * state.sortDir);
+  return rows;
+}
+
+function renderResults() {
+  const all = visibleRows();
+  const size = parseInt($('pg-size').value, 10) || all.length || 1;
+  const pages = Math.max(1, Math.ceil(all.length / size));
+
+  state.page = Math.min(Math.max(1, state.page), pages);
+  const start = (state.page - 1) * size;
+  const rows = all.slice(start, start + size);
+
+  const from = all.length ? start + 1 : 0;
+  $('pg-info').textContent = t('pg.info', {
+    from, to: start + rows.length, total: all.length,
+    page: state.page, pages,
+  });
+  $('pg-first').disabled = $('pg-prev').disabled = state.page <= 1;
+  $('pg-next').disabled = $('pg-last').disabled = state.page >= pages;
+  // Hide only when there is nothing to page through. Hiding it because the
+  // page holds everything would strand anyone who picked "All".
+  document.querySelector('.pager').style.display = all.length ? '' : 'none';
 
   $('results').tBodies[0].innerHTML = rows.map(r => {
     const cls = r.confidence >= 60 ? 'hi' : r.confidence >= 35 ? 'mid' : 'lo';
@@ -657,6 +799,7 @@ async function loadRun(id) {
   const data = await (await fetch(`/api/runs/${id}`)).json();
   state.runId = id;
   state.results = data.results;
+  state.page = 1;
   $('s-run').hidden = false;
   $('st-done').textContent = data.results.length;
   $('st-hit').textContent = data.results.filter(hasContact).length;
@@ -684,6 +827,7 @@ function safeUrl(u) {
 }
 
 applyLang();
+applyTheme();
 dropDefault();
 </script>
 </body>
