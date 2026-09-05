@@ -361,75 +361,79 @@ async def process_batch(
     if not rows:
         return []
 
+    owns_cache = cache is None
     cache = cache or Cache(config.cache_path, config.cache_ttl, config.use_cache)
-    search = SearchClient(config, cache)
-    sem = asyncio.Semaphore(config.max_threads_companies)
-    total = len(rows)
-    done = 0
-    lock = asyncio.Lock()
+    search = None
+    tasks = []
+    try:
+        search = SearchClient(config, cache)
+        sem = asyncio.Semaphore(config.max_threads_companies)
+        total = len(rows)
+        done = 0
+        lock = asyncio.Lock()
 
-    async with Fetcher(config, cache) as fetcher:
+        async with Fetcher(config, cache) as fetcher:
 
-        async def one(index: int, row: tuple) -> Result:
-            nonlocal done
-            # Rows may carry an optional 4th element, the postal address
-            name, country, products, *extra = row
-            address = extra[0] if extra else None
+            async def one(index: int, row: tuple) -> Result:
+                nonlocal done
+                name, country, products, *extra = row
+                address = extra[0] if extra else None
+                key = dedupe_key(name) if store and config.use_company_store else ""
+                if key:
+                    remembered = store.get_company(key, config.company_ttl)
+                    if remembered:
+                        res = Result(**remembered)
+                        res.notes.append("from company store")
+                        res.elapsed = 0.0
+                        async with lock:
+                            done += 1
+                            position = done
+                        await _emit(on_event, {
+                            "type": "progress", "index": index,
+                            "done": position, "total": total, "result": res,
+                        })
+                        return res
 
-            # A company already looked up recently needs no network at all
-            key = dedupe_key(name) if store and config.use_company_store else ""
-            if key:
-                remembered = store.get_company(key, config.company_ttl)
-                if remembered:
-                    res = Result(**remembered)
-                    res.notes.append("from company store")
-                    res.elapsed = 0.0
-                    async with lock:
-                        done += 1
-                        position = done
-                    await _emit(on_event, {
-                        "type": "progress", "index": index,
-                        "done": position, "total": total, "result": res,
-                    })
-                    return res
+                async with sem:
+                    try:
+                        res = await scan_company(
+                            name, config, fetcher, search,
+                            country=country, products=products, address=address,
+                            on_event=on_event,
+                        )
+                    except SearchError:
+                        raise
+                    except Exception as exc:
+                        res = Result(query=name, company=name, country=country,
+                                     products=products, address=address)
+                        res.notes.append(f"error: {exc}")
+                    else:
+                        if key:
+                            store.save_company(key, res)
+                async with lock:
+                    done += 1
+                    position = done
+                await _emit(on_event, {
+                    "type": "progress", "index": index,
+                    "done": position, "total": total, "result": res,
+                })
+                return res
 
-            async with sem:
-                try:
-                    res = await scan_company(
-                        name, config, fetcher, search,
-                        country=country, products=products, address=address,
-                        on_event=on_event,
-                    )
-                except SearchError:
-                    # The backend itself is misconfigured or unreachable. Every
-                    # remaining row would fail identically and look like "no
-                    # web presence", so stop the run and say why.
-                    raise
-                except Exception as exc:  # one bad row must not sink the batch
-                    res = Result(query=name, company=name, country=country,
-                                 products=products, address=address)
-                    res.notes.append(f"error: {exc}")
-                else:
-                    if key:
-                        store.save_company(key, res)
-            async with lock:
-                done += 1
-                position = done
-            await _emit(
-                on_event,
-                {
-                    "type": "progress",
-                    "index": index,
-                    "done": position,
-                    "total": total,
-                    "result": res,
-                },
-            )
-            return res
-
-        results = await asyncio.gather(*(one(i, r) for i, r in enumerate(rows)))
-
-    return list(results)
+            tasks = [asyncio.create_task(one(i, row)) for i, row in enumerate(rows)]
+            try:
+                return list(await asyncio.gather(*tasks))
+            finally:
+                # gather does not stop siblings when one raises. Drain them
+                # before closing the Fetcher, cache or application Store.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        if search is not None:
+            await search.aclose()
+        if owns_cache:
+            cache.close()
 
 
 async def discover_trade_leads(
@@ -440,33 +444,37 @@ async def discover_trade_leads(
     cache: Cache | None = None,
 ) -> list[Candidate]:
     """Find new companies for a product keyword, best-scoring first."""
+    owns_cache = cache is None
     cache = cache or Cache(config.cache_path, config.cache_ttl, config.use_cache)
-    search = SearchClient(config, cache)
+    search = None
+    try:
+        search = SearchClient(config, cache)
+        keywords = [k.strip() for k in keyword.split(",") if k.strip()]
+        queries: list[str] = []
+        for kw in keywords:
+            queries.extend(build_discovery_queries(kw, region))
+        found = await search.search_many(queries, limit=max(8, limit), country=region or None)
 
-    keywords = [k.strip() for k in keyword.split(",") if k.strip()]
-    queries: list[str] = []
-    for kw in keywords:
-        queries.extend(build_discovery_queries(kw, region))
+        by_domain: dict[str, Candidate] = {}
+        for cand in found:
+            domain = extract_domain(cand.url)
+            if not domain:
+                continue
+            existing = by_domain.get(domain)
+            if existing is None or (existing.is_directory and not cand.is_directory):
+                by_domain[domain] = cand
 
-    found = await search.search_many(queries, limit=max(8, limit), country=region or None)
+        from core.config import DIRECTORY_HOSTS
+        from core.utils import host_of
 
-    # One lead per domain; prefer real sites over directory listings
-    by_domain: dict[str, Candidate] = {}
-    for cand in found:
-        domain = extract_domain(cand.url)
-        if not domain:
-            continue
-        existing = by_domain.get(domain)
-        if existing is None or (existing.is_directory and not cand.is_directory):
-            by_domain[domain] = cand
-
-    from core.config import DIRECTORY_HOSTS
-    from core.utils import host_of
-
-    leads = []
-    for cand in by_domain.values():
-        cand.is_directory = any(d in host_of(cand.url) for d in DIRECTORY_HOSTS)
-        leads.append(cand)
-
-    leads.sort(key=lambda c: (not c.is_directory, len(c.snippet)), reverse=True)
-    return leads[:limit]
+        leads = []
+        for cand in by_domain.values():
+            cand.is_directory = any(d in host_of(cand.url) for d in DIRECTORY_HOSTS)
+            leads.append(cand)
+        leads.sort(key=lambda c: (not c.is_directory, len(c.snippet)), reverse=True)
+        return leads[:limit]
+    finally:
+        if search is not None:
+            await search.aclose()
+        if owns_cache:
+            cache.close()

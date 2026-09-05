@@ -62,7 +62,7 @@
     color: var(--accent-ink); margin-right: 8px; font-size: 11px;
   }
   label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
-  select, input[type=text], input[type=number] {
+  select, input[type=text], input[type=number], input[type=password] {
     width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px;
     background: var(--bg); color: var(--ink); font: inherit; font-size: 13px;
   }
@@ -117,6 +117,7 @@
 <header>
   <h1 data-i18n="app.title">B2B Contact Finder</h1>
   <span class="sub" data-i18n="app.sub">runs locally · 127.0.0.1</span>
+  <span class="sub" id="app-version"></span>
   <span class="spacer"></span>
   <div class="lang">
     <button id="lang-en" data-lang="en">EN</button>
@@ -127,6 +128,51 @@
 </header>
 
 <main>
+  <section id="s-settings">
+    <details id="settings-details">
+      <summary data-i18n="settings.title">Search settings</summary>
+    <p class="muted" data-i18n="settings.hint">Saved on this computer. Searching uses these settings; saving does not test network access.</p>
+    <div class="grid g3">
+      <div>
+        <label for="provider" data-i18n="adv.provider">Search backend</label>
+        <select id="provider" disabled>
+          <option value="ddg">DuckDuckGo</option>
+          <option value="searxng">SearXNG</option>
+          <option value="brave">Brave API</option>
+          <option value="serper">Serper API</option>
+        </select>
+      </div>
+      <div id="searx-wrap" hidden>
+        <label for="searxurl" data-i18n="settings.url">SearXNG URL</label>
+        <input type="text" id="searxurl" placeholder="http://127.0.0.1:8080" disabled>
+      </div>
+      <div id="key-wrap" hidden>
+        <label for="search-key" data-i18n="settings.key">API key (Brave / Serper)</label>
+        <input type="password" id="search-key" autocomplete="new-password" spellcheck="false"
+               data-i18n-ph="settings.key.ph" placeholder="Enter a new key to replace the retained key" disabled>
+        <p id="key-status" class="muted" role="status"></p>
+        <label class="inline"><input type="checkbox" id="remove-key" disabled>
+          <span data-i18n="settings.remove">Remove retained key on save</span></label>
+      </div>
+    </div>
+    <p id="settings-overrides" class="muted"></p>
+    <div class="row" style="margin-top:12px">
+      <button id="btn-save-settings" data-i18n="settings.save" disabled>Save settings</button>
+      <button id="btn-reload-settings" data-i18n="settings.reload">Reload settings</button>
+      <span id="settings-status" role="status" aria-live="polite"></span>
+    </div>
+    <details style="margin-top:14px">
+      <summary data-i18n="migrate.title">Advanced: import data from an old installation</summary>
+      <p class="muted" data-i18n="migrate.hint">Stop the old app first. Import before uploading files or starting searches. Existing history and uploads will never be overwritten; import is refused unless the destination is empty and no searches are running.</p>
+      <label for="migrate-source" data-i18n="migrate.source">Old installation / data folder (full path)</label>
+      <input type="text" id="migrate-source" data-i18n-ph="migrate.source.ph" placeholder="C:\Users\YourName\OldFinder">
+      <div class="row" style="margin-top:10px">
+        <button id="btn-migrate" data-i18n="migrate.import">Import old data</button>
+        <span id="migrate-status" role="status" aria-live="polite"></span>
+      </div>
+    </details>
+    </details>
+  </section>
   <!-- 1. FILE -->
   <section id="s-file">
     <h2><span class="step">1</span><span data-i18n="s1.title">Choose a raw data file</span></h2>
@@ -207,17 +253,6 @@
         <div><label data-i18n="adv.delay">Delay (seconds)</label>
           <input type="number" id="delay" value="0" min="0" step="0.1"></div>
         <div>
-          <label data-i18n="adv.provider">Search backend</label>
-          <select id="provider">
-            <option value="ddg">DuckDuckGo</option>
-            <option value="searxng">SearXNG (self-hosted)</option>
-            <option value="brave">Brave API</option>
-            <option value="serper">Serper API</option>
-          </select>
-          <input type="text" id="searxurl" style="margin-top:4px;display:none"
-                 placeholder="http://127.0.0.1:8080">
-        </div>
-        <div>
           <label data-i18n="adv.other">Other</label>
           <div style="font-size:12px">
             <label class="inline"><input type="checkbox" id="usecache" checked>
@@ -245,6 +280,7 @@
       <button class="primary" id="btn-run" disabled data-i18n="s2.run">Start searching</button>
       <span id="plan-info" class="muted"></span>
     </div>
+    <p id="run-error" class="err" role="alert"></p>
   </section>
 
   <!-- 3. RESULTS -->
@@ -312,6 +348,7 @@
   <section id="s-history" hidden>
     <h2 data-i18n="hist.title">Run history</h2>
     <div class="tablewrap"><table id="history"></table></div>
+    <p id="history-error" class="err" role="alert"></p>
   </section>
 </main>
 
@@ -369,6 +406,41 @@ const STRINGS = {
     'run.loaded': 'run {id}',
     'guess.hint': 'guessed from MX record, not confirmed',
     'err.upload': 'Upload failed',
+    'settings.title': 'Search settings and data import',
+    'settings.hint': 'DuckDuckGo needs no setup. Settings are saved on this computer. Saving does not test network access.',
+    'settings.url': 'SearXNG URL', 'settings.key': 'API key (Brave / Serper)',
+    'settings.key.ph': 'Enter a new key to replace the retained key',
+    'settings.retained': 'A key is retained. Leave this field untouched to keep it.',
+    'settings.noKey': 'No key is configured. Brave and Serper require a key.',
+    'settings.keyChanged': 'A replacement key will be saved. The same key is shared by Brave and Serper; use a key for the selected provider.',
+    'settings.keyRemoved': 'The retained key will be removed when you save.',
+    'settings.remove': 'Remove retained key on save',
+    'settings.save': 'Save settings', 'settings.reload': 'Reload settings',
+    'settings.loading': 'Loading settings…', 'settings.saving': 'Saving settings…',
+    'settings.saved': 'Settings saved. Network access has not been tested.',
+    'settings.ready': 'Settings loaded.', 'settings.unsaved': 'Unsaved changes.',
+    'settings.required': 'Load settings successfully before saving or searching. Use Reload settings.',
+    'settings.overrides': 'Environment overrides: {fields}. These locked values take precedence over saved settings. Remove the environment variables and restart the app to change them here.',
+    'settings.reloadConfirm': 'Discard unsaved settings changes and reload?',
+    'settings.invalidUrl': 'Enter a complete http:// or https:// SearXNG URL, without credentials.',
+    'settings.invalidKey': 'Enter an API key for the selected provider, or choose DuckDuckGo / SearXNG.',
+    'settings.version': 'Version {version}',
+    'migrate.title': 'Advanced: import data from an old installation',
+    'migrate.hint': 'Stop the old app first. Import before uploading files or starting searches. Existing history and uploads will never be overwritten; import is refused unless the destination is empty and no searches are running.',
+    'migrate.source': 'Old installation / data folder (full path)',
+    'migrate.source.ph': 'C:\\Users\\YourName\\OldFinder',
+    'migrate.import': 'Import old data', 'migrate.busy': 'Importing data…',
+    'migrate.required': 'Enter the full path to the old installation or data folder.',
+    'migrate.confirm': 'Have you stopped the old app? Import from “{path}”? Import requires empty destination history and uploads and will not overwrite existing data.',
+    'migrate.done': 'Imported: {files}. Open History to view imported runs.',
+    'migrate.empty': 'No data was imported. Check that the selected folder contains old app data.',
+    'err.network': 'Cannot reach the local app. Open B2B Contact Finder again, then retry. If a request was submitted, check History before repeating it.',
+    'err.auth': 'This browser session is no longer authorized. Reopen the page from B2B Contact Finder.',
+    'err.invalid': 'Invalid request or settings. Check the selected fields and search settings, then retry.',
+    'err.backend': 'The request failed. Check that the app and selected search backend are running, then check network access, the backend URL and API key before retrying.',
+    'err.http': 'Request failed (HTTP {status}).',
+    'err.response': 'The app returned an unreadable response. Reopen B2B Contact Finder and retry.',
+    'run.recover': 'Live updates stopped. Reopen this run from History to check its status; do not start a duplicate search.',
   },
   vi: {
     'app.title': 'B2B Contact Finder', 'app.sub': 'chạy cục bộ · 127.0.0.1',
@@ -419,6 +491,41 @@ const STRINGS = {
     'run.loaded': 'lần chạy {id}',
     'guess.hint': 'đoán từ bản ghi MX, chưa xác nhận',
     'err.upload': 'Tải lên thất bại',
+    'settings.title': 'Cài đặt tìm kiếm và nhập dữ liệu',
+    'settings.hint': 'DuckDuckGo không cần thiết lập. Cài đặt được lưu trên máy này. Lưu không kiểm tra kết nối mạng.',
+    'settings.url': 'URL SearXNG', 'settings.key': 'Khoá API (Brave / Serper)',
+    'settings.key.ph': 'Nhập khoá mới để thay khoá đang lưu',
+    'settings.retained': 'Đã có khoá. Giữ nguyên ô này để tiếp tục dùng khoá đó.',
+    'settings.noKey': 'Chưa có khoá. Brave và Serper cần khoá API.',
+    'settings.keyChanged': 'Khoá mới sẽ được lưu. Brave và Serper dùng chung một ô khoá; hãy dùng khoá của nguồn đã chọn.',
+    'settings.keyRemoved': 'Khoá đang lưu sẽ bị xoá khi bấm lưu.',
+    'settings.remove': 'Xoá khoá đang lưu khi bấm lưu',
+    'settings.save': 'Lưu cài đặt', 'settings.reload': 'Tải lại cài đặt',
+    'settings.loading': 'Đang tải cài đặt…', 'settings.saving': 'Đang lưu cài đặt…',
+    'settings.saved': 'Đã lưu cài đặt. Chưa kiểm tra kết nối mạng.',
+    'settings.ready': 'Đã tải cài đặt.', 'settings.unsaved': 'Có thay đổi chưa lưu.',
+    'settings.required': 'Cần tải cài đặt thành công trước khi lưu hoặc tìm kiếm. Bấm Tải lại cài đặt.',
+    'settings.overrides': 'Biến môi trường đang ghi đè: {fields}. Các giá trị bị khoá này được ưu tiên hơn cài đặt đã lưu. Xoá biến môi trường và khởi động lại ứng dụng để sửa tại đây.',
+    'settings.reloadConfirm': 'Bỏ thay đổi chưa lưu và tải lại cài đặt?',
+    'settings.invalidUrl': 'Nhập URL SearXNG đầy đủ với http:// hoặc https://, không chứa thông tin đăng nhập.',
+    'settings.invalidKey': 'Nhập khoá API cho nguồn đã chọn, hoặc chọn DuckDuckGo / SearXNG.',
+    'settings.version': 'Phiên bản {version}',
+    'migrate.title': 'Nâng cao: nhập dữ liệu từ bản cài đặt cũ',
+    'migrate.hint': 'Dừng ứng dụng cũ trước. Nhập dữ liệu trước khi tải file lên hoặc tìm kiếm. Không ghi đè lịch sử hay file đã tải; chỉ nhập khi nơi nhận trống và không có lượt tìm đang chạy.',
+    'migrate.source': 'Thư mục ứng dụng / dữ liệu cũ (đường dẫn đầy đủ)',
+    'migrate.source.ph': 'C:\\Users\\TenBan\\FinderCu',
+    'migrate.import': 'Nhập dữ liệu cũ', 'migrate.busy': 'Đang nhập dữ liệu…',
+    'migrate.required': 'Nhập đường dẫn đầy đủ tới thư mục ứng dụng hoặc dữ liệu cũ.',
+    'migrate.confirm': 'Bạn đã dừng ứng dụng cũ chưa? Nhập từ “{path}”? Lịch sử và file tải lên tại nơi nhận phải trống; không ghi đè dữ liệu hiện có.',
+    'migrate.done': 'Đã nhập: {files}. Mở Lịch sử để xem các lượt chạy đã nhập.',
+    'migrate.empty': 'Không có dữ liệu được nhập. Kiểm tra thư mục đã chọn có dữ liệu ứng dụng cũ.',
+    'err.network': 'Không kết nối được ứng dụng cục bộ. Mở lại B2B Contact Finder rồi thử lại. Nếu đã gửi yêu cầu, kiểm tra Lịch sử trước khi gửi lại.',
+    'err.auth': 'Phiên trình duyệt không còn được cấp quyền. Mở lại trang từ B2B Contact Finder.',
+    'err.invalid': 'Yêu cầu hoặc cài đặt không hợp lệ. Kiểm tra các trường đã chọn và cài đặt tìm kiếm rồi thử lại.',
+    'err.backend': 'Yêu cầu thất bại. Kiểm tra ứng dụng và nguồn tìm kiếm đã chạy, kết nối mạng, URL nguồn và khoá API trước khi thử lại.',
+    'err.http': 'Yêu cầu thất bại (HTTP {status}).',
+    'err.response': 'Ứng dụng trả về phản hồi không đọc được. Mở lại B2B Contact Finder rồi thử lại.',
+    'run.recover': 'Đã dừng cập nhật trực tiếp. Mở lại lượt chạy từ Lịch sử để kiểm tra trạng thái; không khởi chạy lượt tìm trùng.',
   },
 };
 
@@ -452,6 +559,8 @@ function applyLang() {
   // The theme button's tooltip is language-dependent and state-dependent, so
   // it has to be rewritten after the generic data-i18n-title pass above.
   applyTheme();
+  renderSettings();
+  dropDefault();
 }
 
 document.querySelectorAll('.lang button').forEach(b => {
@@ -479,7 +588,183 @@ $('btn-theme').onclick = () => {
 
 const state = { fileId: null, headers: [], sheets: [], runId: null, es: null,
                 results: [], sortKey: 'confidence', sortDir: -1, startedAt: 0, page: 1,
-                timer: null, sample: [], fileMeta: null, plan: null, mapping: {} };
+                timer: null, sample: [], fileMeta: null, plan: null, mapping: {},
+                settings: null, settingsBusy: false, settingsDirty: false, keyTouched: false,
+                settingsMessage: null, running: false, starting: false };
+
+// ---------- API and saved settings ----------
+function errorDetail(detail) {
+  let message = typeof detail === 'string' ? detail : Array.isArray(detail)
+    ? detail.map(item => typeof item.msg === 'string' ? item.msg : '').filter(Boolean).join('; ') : '';
+  const key = $('search-key').value;
+  if (key) message = message.replaceAll(key, '[redacted]');
+  return message;
+}
+
+async function apiRequest(url, options = {}, format = 'json') {
+  let response;
+  try {
+    response = await fetch(url, { credentials: 'same-origin', ...options });
+  } catch {
+    throw new Error(t('err.network'));
+  }
+  if (!response.ok) {
+    let detail = '';
+    try { detail = errorDetail((await response.json()).detail); } catch {}
+    const hint = response.status === 401 || response.status === 403 ? t('err.auth')
+      : response.status === 400 || response.status === 422 ? t('err.invalid')
+      : response.status >= 500 ? t('err.backend') : t('err.http', { status: response.status });
+    throw new Error(detail ? `${hint} ${detail}` : hint);
+  }
+  try {
+    return format === 'blob' ? await response.blob()
+      : response.status === 204 ? null : await response.json();
+  } catch {
+    throw new Error(t('err.response'));
+  }
+}
+
+function jsonRequest(method, body) {
+  return { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+}
+
+function settingsStatus(key, error = false, message = '') {
+  state.settingsMessage = { key, error, message };
+  if (error) $('settings-details').open = true;
+  renderSettings();
+}
+
+function updateRunButton() {
+  $('btn-run').disabled = !state.settings || state.settingsBusy || state.starting ||
+    state.running || !state.plan || state.plan.job_count === 0;
+}
+
+function renderSettings() {
+  const provider = $('provider').value;
+  const overrides = state.settings?.env_overrides || [];
+  const locked = field => state.settingsBusy || !state.settings || overrides.includes(field);
+  $('provider').disabled = locked('search_provider');
+  $('searxurl').disabled = locked('searxng_url');
+  $('search-key').disabled = locked('search_api_key') || $('remove-key').checked;
+  $('remove-key').disabled = locked('search_api_key');
+  $('searx-wrap').hidden = provider !== 'searxng';
+  $('key-wrap').hidden = provider !== 'brave' && provider !== 'serper';
+  $('key-status').textContent = t($('remove-key').checked ? 'settings.keyRemoved'
+    : state.keyTouched && $('search-key').value ? 'settings.keyChanged'
+    : state.settings?.has_api_key ? 'settings.retained' : 'settings.noKey');
+  const fieldLabels = { search_provider: t('adv.provider'), searxng_url: t('settings.url'),
+                        search_api_key: t('settings.key') };
+  $('settings-overrides').textContent = overrides.length
+    ? t('settings.overrides', { fields: overrides.map(field => fieldLabels[field] || field).join(', ') }) : '';
+  $('btn-save-settings').disabled = state.settingsBusy || !state.settings || state.starting;
+  $('btn-reload-settings').disabled = state.settingsBusy || state.starting;
+  $('app-version').textContent = state.settings ? t('settings.version', { version: state.settings.version }) : '';
+  if (state.settingsMessage) {
+    $('settings-status').className = state.settingsMessage.error ? 'err' : 'muted';
+    $('settings-status').textContent = state.settingsMessage.key
+      ? t(state.settingsMessage.key) : state.settingsMessage.message;
+  }
+  updateRunButton();
+}
+
+function applySettings(data) {
+  state.settings = data;
+  $('provider').value = data.search_provider;
+  $('searxurl').value = data.searxng_url || '';
+  $('search-key').value = '';
+  $('remove-key').checked = false;
+  state.keyTouched = false;
+  state.settingsDirty = false;
+}
+
+async function loadSettings() {
+  if (state.settingsBusy) return;
+  if (state.settingsDirty && !confirm(t('settings.reloadConfirm'))) return;
+  state.settingsBusy = true;
+  settingsStatus('settings.loading');
+  try {
+    applySettings(await apiRequest('/api/settings'));
+    settingsStatus('settings.ready');
+  } catch (err) {
+    state.settings = null;
+    settingsStatus(null, true, err.message);
+  } finally {
+    state.settingsBusy = false;
+    renderSettings();
+  }
+}
+
+async function saveSettings() {
+  if (!state.settings || state.settingsBusy) throw new Error(t('settings.required'));
+  const provider = $('provider').value;
+  const url = $('searxurl').value.trim();
+  if (provider === 'searxng') {
+    let parsed;
+    try { parsed = new URL(url); } catch {}
+    if (!parsed || !['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+      throw new Error(t('settings.invalidUrl'));
+    }
+  }
+  const body = { search_provider: provider, searxng_url: url };
+  if (!state.settings.env_overrides.includes('search_api_key')) {
+    if ($('remove-key').checked) body.search_api_key = '';
+    else if (state.keyTouched && $('search-key').value) body.search_api_key = $('search-key').value;
+  }
+  state.settingsBusy = true;
+  settingsStatus('settings.saving');
+  try {
+    await apiRequest('/api/settings', jsonRequest('PUT', body));
+    applySettings(await apiRequest('/api/settings'));
+    settingsStatus('settings.saved');
+  } catch (err) {
+    settingsStatus(null, true, err.message);
+    throw err;
+  } finally {
+    state.settingsBusy = false;
+    renderSettings();
+  }
+}
+
+function settingsChanged() {
+  state.settingsDirty = true;
+  settingsStatus('settings.unsaved');
+}
+$('provider').onchange = settingsChanged;
+$('searxurl').oninput = settingsChanged;
+$('search-key').oninput = () => { state.keyTouched = true; settingsChanged(); };
+$('remove-key').onchange = () => {
+  $('search-key').value = '';
+  state.keyTouched = false;
+  settingsChanged();
+};
+$('btn-reload-settings').onclick = loadSettings;
+$('btn-save-settings').onclick = async () => {
+  try { await saveSettings(); } catch (err) { settingsStatus(null, true, err.message); }
+};
+
+$('btn-migrate').onclick = async () => {
+  const source = $('migrate-source').value.trim();
+  const status = $('migrate-status');
+  status.className = 'err';
+  if (!source) { status.textContent = t('migrate.required'); return; }
+  if (!confirm(t('migrate.confirm', { path: source }))) return;
+  $('btn-migrate').disabled = true;
+  $('migrate-source').disabled = true;
+  status.className = 'muted';
+  status.textContent = t('migrate.busy');
+  try {
+    const data = await apiRequest('/api/migrate', jsonRequest('POST', { source_dir: source }));
+    status.textContent = data.imported.length
+      ? t('migrate.done', { files: data.imported.join(', ') }) : t('migrate.empty');
+    if (!$('s-history').hidden) await loadHistory();
+  } catch (err) {
+    status.className = 'err';
+    status.textContent = err.message;
+  } finally {
+    $('btn-migrate').disabled = false;
+    $('migrate-source').disabled = false;
+  }
+};
 
 // ---------- upload ----------
 $('drop').onclick = () => $('file').click();
@@ -511,9 +796,7 @@ async function upload(file) {
   const fd = new FormData();
   fd.append('file', file);
   try {
-    const res = await fetch('/api/upload', { method: 'POST', body: fd });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || t('err.upload'));
+    const data = await apiRequest('/api/upload', { method: 'POST', body: fd });
     state.fileId = data.file_id;
     state.fileMeta = data;
     applyTable(data);
@@ -572,12 +855,16 @@ function applyTable(data) {
 }
 
 $('sheet').onchange = async () => {
-  const res = await fetch('/api/preview', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ file_id: state.fileId, sheet: $('sheet').value }),
-  });
-  const data = await res.json();
-  if (res.ok) applyTable(data);
+  state.plan = null;
+  updateRunButton();
+  $('file-err').textContent = '';
+  try {
+    applyTable(await apiRequest('/api/preview', jsonRequest('POST', {
+      file_id: state.fileId, sheet: $('sheet').value,
+    })));
+  } catch (err) {
+    $('file-err').textContent = err.message;
+  }
 };
 
 // ---------- plan ----------
@@ -597,7 +884,14 @@ function planBody() {
 }
 
 let planTimer = null;
-function refreshPlan() { clearTimeout(planTimer); planTimer = setTimeout(doPlan, 250); }
+let planRevision = 0;
+function refreshPlan() {
+  clearTimeout(planTimer);
+  planRevision++;
+  state.plan = null;
+  updateRunButton();
+  planTimer = setTimeout(doPlan, 250);
+}
 ['col-company','col-country','col-product','col-address','dedupe','limit','override']
   .forEach(id => { $(id).oninput = refreshPlan; $(id).onchange = refreshPlan; });
 
@@ -611,36 +905,51 @@ function showPlan(data) {
 
 async function doPlan() {
   if (!state.fileId || !$('col-company').value) return;
-  $('btn-run').disabled = true;
+  const revision = planRevision;
   $('plan-info').textContent = t('plan.calc');
-  const res = await fetch('/api/plan', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(planBody()),
-  });
-  const data = await res.json();
-  if (!res.ok) { $('plan-info').innerHTML = `<span class="err">${esc(data.detail)}</span>`; return; }
-  state.plan = data;
-  showPlan(data);
-  $('btn-run').disabled = data.job_count === 0;
+  try {
+    const data = await apiRequest('/api/plan', jsonRequest('POST', planBody()));
+    if (revision !== planRevision) return;
+    state.plan = data;
+    showPlan(data);
+  } catch (err) {
+    if (revision !== planRevision) return;
+    state.plan = null;
+    $('plan-info').innerHTML = `<span class="err">${esc(err.message)}</span>`;
+  } finally {
+    updateRunButton();
+  }
 }
 
 // ---------- run ----------
 $('btn-run').onclick = async () => {
+  if (state.starting || state.running || !state.plan) return;
+  state.starting = true;
+  $('run-error').textContent = '';
+  renderSettings();
   const body = Object.assign(planBody(), {
     threads: +$('threads').value, max_pages: +$('maxpages').value,
     top_results: +$('topres').value, min_score: +$('minscore').value,
     delay: +$('delay').value, use_cache: $('usecache').checked,
     guess_emails: $('guess').checked, insecure_tls: $('insecure').checked,
     merge_sources: $('merge').checked, use_company_store: $('store').checked,
-    search_provider: $('provider').value,
-    searxng_url: $('searxurl').value || null,
   });
-  const res = await fetch('/api/run', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json();
-  if (!res.ok) { $('plan-info').innerHTML = `<span class="err">${esc(data.detail)}</span>`; return; }
+  let data;
+  try {
+    await saveSettings();
+    if (['brave', 'serper'].includes(state.settings.search_provider) && !state.settings.has_api_key) {
+      settingsStatus('settings.invalidKey', true);
+      throw new Error(t('settings.invalidKey'));
+    }
+    data = await apiRequest('/api/run', jsonRequest('POST', body));
+    state.running = true;
+  } catch (err) {
+    $('run-error').textContent = err.message;
+    return;
+  } finally {
+    state.starting = false;
+    renderSettings();
+  }
 
   state.runId = data.run_id;
   state.results = [];
@@ -661,7 +970,11 @@ $('btn-run').onclick = async () => {
   if (state.es) state.es.close();
   state.es = new EventSource(`/api/runs/${data.run_id}/events`);
   state.es.onmessage = (ev) => handleEvent(JSON.parse(ev.data));
-  state.es.onerror = () => { $('run-status').textContent = t('run.disconnected'); state.es.close(); };
+  state.es.onerror = () => {
+    $('run-status').textContent = `${t('run.disconnected')}. ${t('run.recover')}`;
+    clearInterval(state.timer);
+    state.es.close();
+  };
 };
 
 function handleEvent(ev) {
@@ -675,19 +988,40 @@ function handleEvent(ev) {
     renderResults();
   } else if (ev.type === 'done' || ev.type === 'cancelled' || ev.type === 'error') {
     clearInterval(state.timer);
-    $('btn-run').disabled = false;
+    state.running = false;
+    updateRunButton();
     $('btn-cancel').disabled = true;
     $('run-status').textContent =
       ev.type === 'done' ? t('run.done', { s: ev.elapsed.toFixed(1) })
-      : ev.type === 'cancelled' ? t('run.cancelled') : t('run.error', { msg: ev.message });
+      : ev.type === 'cancelled' ? t('run.cancelled')
+      : `${t('run.error', { msg: errorDetail(ev.message) })} ${t('err.backend')}`;
     if (ev.elapsed) $('st-time').textContent = ev.elapsed.toFixed(0) + 's';
     state.es && state.es.close();
   }
 }
 
-$('btn-cancel').onclick = () => state.runId && fetch(`/api/runs/${state.runId}/cancel`, { method: 'POST' });
-$('btn-csv').onclick = () => state.runId && (location.href = `/api/runs/${state.runId}/export.csv`);
-$('btn-xlsx').onclick = () => state.runId && (location.href = `/api/runs/${state.runId}/export.xlsx`);
+$('btn-cancel').onclick = async () => {
+  if (!state.runId) return;
+  try {
+    await apiRequest(`/api/runs/${encodeURIComponent(state.runId)}/cancel`, { method: 'POST' });
+  } catch (err) { $('run-status').textContent = err.message; }
+};
+
+async function downloadExport(id, extension, errorId = 'run-status') {
+  try {
+    const blob = await apiRequest(`/api/runs/${encodeURIComponent(id)}/export.${extension}`, {}, 'blob');
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `contacts-${id}.${extension}`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) { $(errorId).textContent = err.message; }
+}
+$('btn-csv').onclick = () => state.runId && downloadExport(state.runId, 'csv');
+$('btn-xlsx').onclick = () => state.runId && downloadExport(state.runId, 'xlsx');
 
 const hasContact = (r) => r.priority_emails.length || r.emails.length || r.phones.length;
 
@@ -699,9 +1033,6 @@ document.querySelectorAll('#results th.sortable').forEach(th => {
     renderResults();
   };
 });
-$('provider').onchange = () => {
-  $('searxurl').style.display = $('provider').value === 'searxng' ? '' : 'none';
-};
 // Changing what is shown restarts at page 1; arriving results do not, so a
 // live run does not yank the page out from under whoever is reading it.
 const rerenderFromFirstPage = () => { state.page = 1; renderResults(); };
@@ -773,7 +1104,10 @@ $('btn-history').onclick = () => {
 };
 
 async function loadHistory() {
-  const data = await (await fetch('/api/runs')).json();
+  $('history-error').textContent = '';
+  let data;
+  try { data = await apiRequest('/api/runs'); }
+  catch (err) { $('history-error').textContent = err.message; return; }
   const head = ['hist.when','hist.label','hist.source','hist.status','hist.done','hist.secs']
     .map(k => `<th>${esc(t(k))}</th>`).join('');
   $('history').innerHTML =
@@ -792,11 +1126,18 @@ async function loadHistory() {
   $('history').querySelectorAll('[data-open]').forEach(b =>
     b.onclick = () => loadRun(b.dataset.open));
   $('history').querySelectorAll('[data-xlsx]').forEach(b =>
-    b.onclick = () => location.href = `/api/runs/${b.dataset.xlsx}/export.xlsx`);
+    b.onclick = () => downloadExport(b.dataset.xlsx, 'xlsx', 'history-error'));
 }
 
 async function loadRun(id) {
-  const data = await (await fetch(`/api/runs/${id}`)).json();
+  $('history-error').textContent = '';
+  let data;
+  try { data = await apiRequest(`/api/runs/${encodeURIComponent(id)}`); }
+  catch (err) { $('history-error').textContent = err.message; return; }
+  if (state.es) state.es.close();
+  clearInterval(state.timer);
+  state.running = ['running', 'pending', 'queued'].includes(data.run.status);
+  updateRunButton();
   state.runId = id;
   state.results = data.results;
   state.page = 1;
@@ -808,7 +1149,7 @@ async function loadRun(id) {
   $('st-time').textContent = (data.run.elapsed || 0).toFixed(0) + 's';
   $('bar').style.width = '100%';
   $('run-status').textContent = t('run.loaded', { id });
-  $('btn-cancel').disabled = true;
+  $('btn-cancel').disabled = !state.running;
   renderResults();
   $('s-run').scrollIntoView({ behavior: 'smooth' });
 }
@@ -829,6 +1170,7 @@ function safeUrl(u) {
 applyLang();
 applyTheme();
 dropDefault();
+loadSettings();
 </script>
 </body>
 </html>

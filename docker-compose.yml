@@ -1,6 +1,6 @@
 services:
   # Self-hosted metasearch. Federates Google, Bing, Brave and others behind one
-  # endpoint: no API key, no per-query cost, and the rate limit is yours.
+  # endpoint: no API key; upstream engines can still rate-limit requests.
   searxng:
     # Pinned deliberately loosely: this is a local tool and SearXNG ships
     # frequent engine fixes. To pin, replace with a dated tag from
@@ -14,8 +14,8 @@ services:
       - ./searxng:/etc/searxng:rw
     environment:
       # No default on purpose: a shared, publicly-known secret is worse than a
-      # startup failure. `install.sh` / `install.ps1` generate .env for you.
-      SEARXNG_SECRET: ${SEARXNG_SECRET:?run ./install.sh (or install.ps1) first, or set SEARXNG_SECRET in .env}
+      # startup failure. `install.sh docker` generates .env for you.
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?run ./install.sh docker first, or set SEARXNG_SECRET in .env}
       SEARXNG_BASE_URL: http://localhost:8080/
     # Not published to the host by default — only the app container needs it.
     # Uncomment to open http://127.0.0.1:8080 and search by hand.
@@ -44,6 +44,8 @@ services:
       FINDER_SEARCH_PROVIDER: searxng
       FINDER_SEARXNG_URL: http://searxng:8080
       FINDER_CACHE_DIR: /data
+      FINDER_HOME: /data
+      FINDER_UPLOAD_DIR: /app/.uploads
     volumes:
       # Caches, run history and uploads survive a rebuild
       - finder-data:/data

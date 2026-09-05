@@ -13,15 +13,14 @@ from core.config import (
     DEFAULT_MAX_PAGES,
     DEFAULT_MAX_THREADS_COMPANIES,
     Config,
-    data_dir,
 )
 from core.models import Result
+from core.paths import data_dir
 from core.pipeline import discover_trade_leads, process_batch
 from core.store import Store
 from core.tabular import build_jobs, load_table
 
 TABLE_EXTS = (".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls")
-RUNS_DB = os.path.join(data_dir(), ".runs.db")
 
 CSV_FIELDS = [
     "query", "company", "country", "products", "website", "confidence",
@@ -162,64 +161,65 @@ async def run(args) -> list[Result]:
         config.searxng_url = args.searxng_url
 
     cache = Cache(config.cache_path, config.cache_ttl, config.use_cache)
-    store = Store(RUNS_DB) if config.use_company_store else None
-    cli_products = [p.strip() for p in args.product.split(",") if p.strip()] if args.product else []
+    store = None
+    try:
+        store = Store(os.path.join(data_dir(), ".runs.db")) if config.use_company_store else None
+        cli_products = [p.strip() for p in args.product.split(",") if p.strip()] if args.product else []
 
-    def on_event(event: dict) -> None:
-        if args.json or event.get("type") != "progress":
-            return
-        r = event["result"]
-        contacts = len(r.priority_emails) + len(r.emails)
-        print(f"[{event['done']}/{event['total']}] {r.company or r.query} "
-              f"-> conf {r.confidence:.0f}, {contacts} emails, {len(r.phones)} phones "
-              f"({r.elapsed:.1f}s)")
+        def on_event(event: dict) -> None:
+            if args.json or event.get("type") != "progress":
+                return
+            r = event["result"]
+            contacts = len(r.priority_emails) + len(r.emails)
+            print(f"[{event['done']}/{event['total']}] {r.company or r.query} "
+                  f"-> conf {r.confidence:.0f}, {contacts} emails, {len(r.phones)} phones "
+                  f"({r.elapsed:.1f}s)")
 
-    # 1. Discovery mode
-    if args.keyword:
-        if not args.json:
-            print(f"[*] Discovering companies for '{args.input_value}' "
-                  f"in {args.country or 'Global'}...")
-        leads = await discover_trade_leads(
-            args.input_value, config, region=args.country or "", limit=args.limit, cache=cache
+        if args.keyword:
+            if not args.json:
+                print(f"[*] Discovering companies for '{args.input_value}' "
+                      f"in {args.country or 'Global'}...")
+            leads = await discover_trade_leads(
+                args.input_value, config, region=args.country or "", limit=args.limit, cache=cache
+            )
+            if not args.json:
+                print(f"[*] {len(leads)} candidate companies found. Extracting contacts...")
+            rows = [(lead.title or lead.url, args.country, cli_products) for lead in leads]
+            return await process_batch(rows, config, on_event=on_event, cache=cache, store=store)
+
+        if args.input_value.lower().endswith(TABLE_EXTS):
+            if not os.path.isfile(args.input_value):
+                raise SystemExit(f"[!] File not found: {args.input_value}")
+            headers, table, _, sheet = load_table(args.input_value, args.sheet)
+            jobs = build_jobs(
+                headers, table,
+                company_col=args.csv_column,
+                country_col=args.country_column if args.country_column in headers else None,
+                product_col=args.product_column if args.product_column in headers else None,
+                address_col=args.address_column if args.address_column in headers else None,
+                dedupe=not args.no_dedupe,
+                fuzzy=args.fuzzy_dedupe,
+                limit=args.limit if args.limit_rows else None,
+                product_override=cli_products,
+            )
+            if not args.json:
+                print(f"[*] {sheet}: {len(table)} rows -> {len(jobs)} companies to scan...")
+            return await process_batch(
+                [j.as_row() for j in jobs], config, on_event=on_event, cache=cache, store=store
+            )
+
+        results = await process_batch(
+            [(args.input_value, args.country, cli_products, args.address)],
+            config, cache=cache, store=store,
         )
         if not args.json:
-            print(f"[*] {len(leads)} candidate companies found. Extracting contacts...")
-        rows = [(lead.title or lead.url, args.country, cli_products) for lead in leads]
-        return await process_batch(rows, config, on_event=on_event, cache=cache, store=store)
-
-    # 2. Batch mode from a spreadsheet or CSV
-    if args.input_value.lower().endswith(TABLE_EXTS):
-        if not os.path.isfile(args.input_value):
-            # Without this the missing path falls through to single mode and
-            # we search the web for the literal string "companies.csv".
-            raise SystemExit(f"[!] File not found: {args.input_value}")
-
-        headers, table, _, sheet = load_table(args.input_value, args.sheet)
-        jobs = build_jobs(
-            headers, table,
-            company_col=args.csv_column,
-            country_col=args.country_column if args.country_column in headers else None,
-            product_col=args.product_column if args.product_column in headers else None,
-            address_col=args.address_column if args.address_column in headers else None,
-            dedupe=not args.no_dedupe,
-            fuzzy=args.fuzzy_dedupe,
-            limit=args.limit if args.limit_rows else None,
-            product_override=cli_products,
-        )
-        if not args.json:
-            print(f"[*] {sheet}: {len(table)} rows -> {len(jobs)} companies to scan...")
-        rows = [j.as_row() for j in jobs]
-        return await process_batch(rows, config, on_event=on_event, cache=cache, store=store)
-
-    # 3. Single company / domain
-    results = await process_batch(
-        [(args.input_value, args.country, cli_products, args.address)],
-        config, cache=cache, store=store,
-    )
-    if not args.json:
-        for r in results:
-            print_human(r)
-    return results
+            for result in results:
+                print_human(result)
+        return results
+    finally:
+        cache.close()
+        if store is not None:
+            store.close()
 
 
 def main(argv: list[str]) -> int:

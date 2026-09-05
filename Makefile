@@ -24,7 +24,7 @@ help:
 	@echo "  make keyword Q=\"...\"    - discover new leads from a product keyword"
 	@echo "  make batch [IN=file]    - process a .csv or .xlsx file"
 	@echo "  make clean-cache        - drop the HTTP/search cache only"
-	@echo "  make clean              - remove the venv, caches and generated CSVs"
+	@echo "  make clean              - remove the development venv (keep user data)"
 
 install:
 	test -d $(VENV_DIR) || python3 -m venv $(VENV_DIR)
@@ -75,9 +75,8 @@ rebuild:
 	docker compose up -d --build
 
 clean-cache:
-	rm -f .cache.db .cache.db-wal .cache.db-shm
+	@echo "Stop the app before clearing the cache."
+	$(PYTHON) -c "from pathlib import Path; from core.paths import data_dir; root = Path(data_dir()); [(root / ('.cache.db' + suffix)).unlink(missing_ok=True) for suffix in ('', '-wal', '-shm')]"
 
-clean: clean-cache
-	rm -rf $(VENV_DIR) .uploads
-	rm -f .runs.db .runs.db-wal .runs.db-shm
-	rm -f leads_*.csv results_*.csv
+clean:
+	rm -rf $(VENV_DIR)

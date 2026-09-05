@@ -56,6 +56,19 @@ class Store:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def interrupt_runs(self) -> None:
+        """A previous process cannot still own these runs after restart."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE runs SET status = 'interrupted', error = ? WHERE status = 'running'",
+                ("The application stopped before this search finished. Start a new search to continue.",),
+            )
+            self._conn.commit()
+
     def create_run(self, label: str, source: str, total: int, settings: dict) -> str:
         run_id = uuid.uuid4().hex[:12]
         with self._lock:

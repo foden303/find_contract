@@ -12,14 +12,21 @@ import json
 import os
 import time
 import uuid
+import hmac
+import sqlite3
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from core.cache import Cache
-from core.config import Config, data_dir
+from core.config import Config
+from core.migration import import_legacy
+from core.paths import data_dir, upload_dir
+from core.settings import public_settings, save_settings, validate_search
+from core.version import VERSION
 from core.models import Result
 from core.pipeline import process_batch
 from core.store import Store
@@ -31,16 +38,66 @@ from core.tabular import (
     preview_table,
 )
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-UPLOAD_DIR = os.getenv("FINDER_UPLOAD_DIR") or os.path.join(ROOT, ".uploads")
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    global store
+    upload_dir()
+    store = Store(os.path.join(data_dir(), ".runs.db"))
+    store.interrupt_runs()
+    application.state.migrating = False
+    application.state.ready = True
+    try:
+        yield
+    finally:
+        application.state.ready = False
+        tasks = [handle.task for handle in RUNS.values() if handle.task and not handle.task.done()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        RUNS.clear()
+        store.close()
+
+
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-RUNS_DB = os.path.join(data_dir(), ".runs.db")
+store: Store
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-app = FastAPI(title="B2B Contact Finder", docs_url=None, redoc_url=None)
-store = Store(RUNS_DB)
+app = FastAPI(title="B2B Contact Finder", version=VERSION, docs_url=None, redoc_url=None,
+              openapi_url=None, lifespan=lifespan)
+
+
+@app.middleware("http")
+async def local_access(request: Request, call_next):
+    # Loopback binding alone does not stop a malicious website from posting
+    # to localhost, or a hostile Host header from a DNS rebinding request.
+    if request.url.hostname not in ("127.0.0.1", "localhost", "::1"):
+        return JSONResponse({"detail": "Only local application access is allowed."}, status_code=403)
+    origin = request.headers.get("origin")
+    expected = f"{request.url.scheme}://{request.url.netloc}"
+    if origin and origin != expected:
+        return JSONResponse({"detail": "Cross-origin access is not allowed."}, status_code=403)
+    if request.url.path.startswith("/api/") and request.headers.get("sec-fetch-site") == "cross-site":
+        return JSONResponse({"detail": "Cross-site access is not allowed."}, status_code=403)
+    token = os.getenv("FINDER_SESSION_TOKEN")
+    if token:
+        launch_token = request.query_params.get("token", "")
+        if request.method == "GET" and request.url.path == "/" and hmac.compare_digest(launch_token, token):
+            response = RedirectResponse("/", status_code=303)
+            response.set_cookie("finder-session", token, httponly=True, samesite="strict")
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        supplied = request.headers.get("x-finder-token") or request.cookies.get("finder-session", "")
+        if not hmac.compare_digest(supplied, token):
+            return JSONResponse({"detail": "Open Contact Finder from its shortcut to reconnect."}, status_code=401)
+    if getattr(app.state, "migrating", False) and request.url.path != "/api/health":
+        return JSONResponse({"detail": "Data import is in progress. Please wait."}, status_code=409)
+    response = await call_next(request)
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 # --- Live run registry -----------------------------------------------------
@@ -107,7 +164,7 @@ class RunRequest(PlanRequest):
     merge_sources: bool = False
     insecure_tls: bool = False
     use_company_store: bool = True
-    search_provider: str = "ddg"
+    search_provider: str | None = None
     searxng_url: str | None = None
 
 
@@ -118,9 +175,9 @@ def _upload_path(file_id: str) -> str:
     """Resolve a file id to a path inside the upload directory, or 404."""
     if not file_id or "/" in file_id or "\\" in file_id or ".." in file_id:
         raise HTTPException(400, "Invalid file id")
-    for name in os.listdir(UPLOAD_DIR):
+    for name in os.listdir(upload_dir()):
         if name.startswith(file_id + "."):
-            return os.path.join(UPLOAD_DIR, name)
+            return os.path.join(upload_dir(), name)
     raise HTTPException(404, "Uploaded file not found — please upload it again")
 
 
@@ -163,10 +220,14 @@ def _config_from(req: RunRequest) -> Config:
         merge_sources=req.merge_sources,
         insecure_tls=req.insecure_tls,
         use_company_store=req.use_company_store,
-        search_provider=req.search_provider or "ddg",
+        search_provider=req.search_provider,
+        searxng_url=req.searxng_url,
     )
-    if req.searxng_url:
-        cfg.searxng_url = req.searxng_url
+    validate_search({
+        "search_provider": cfg.search_provider,
+        "searxng_url": cfg.searxng_url,
+        "search_api_key": cfg.search_api_key,
+    })
     return cfg
 
 
@@ -199,6 +260,69 @@ def _flatten(row: dict) -> list[str]:
 # --- Routes ----------------------------------------------------------------
 
 
+@app.get("/api/health")
+async def health():
+    return {
+        "app": "b2b-contact-finder", "version": VERSION,
+        "active_runs": sum(bool(h.task and not h.task.done()) for h in RUNS.values()),
+        "ready": getattr(app.state, "ready", False),
+    }
+
+@app.post("/api/desktop/exit")
+async def desktop_exit():
+    event = getattr(app.state, "desktop_exit", None)
+    if event is None:
+        raise HTTPException(404, "Desktop lifecycle control is unavailable in source/server mode.")
+    event.set()
+    return {"ok": True}
+
+
+class SettingsRequest(BaseModel):
+    search_provider: str
+    searxng_url: str
+    search_api_key: str | None = None
+
+
+@app.get("/api/settings")
+async def settings():
+    try:
+        return {**public_settings(), "version": VERSION}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.put("/api/settings")
+async def update_settings(req: SettingsRequest):
+    try:
+        return {**save_settings(req.model_dump(exclude_unset=True)), "version": VERSION}
+    except (ValueError, OSError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class MigrationRequest(BaseModel):
+    source_dir: str
+
+
+@app.post("/api/migrate")
+async def migrate(req: MigrationRequest):
+    global store
+    if app.state.migrating or any(h.task and not h.task.done() for h in RUNS.values()):
+        raise HTTPException(409, "Stop all searches before importing old data.")
+    app.state.migrating = True
+    store.close()
+    try:
+        # Run synchronously while the Store is closed: no request can retain
+        # a reference across the database replacement boundary.
+        imported = import_legacy(req.source_dir)
+        return {"imported": imported}
+    except (ValueError, OSError, sqlite3.DatabaseError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    finally:
+        store = Store(os.path.join(data_dir(), ".runs.db"))
+        store.interrupt_runs()
+        app.state.migrating = False
+
+
 @app.get("/")
 async def index():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
@@ -215,7 +339,7 @@ async def upload(file: UploadFile = File(...)):
         raise HTTPException(400, "File is larger than 64 MB")
 
     file_id = uuid.uuid4().hex[:12]
-    path = os.path.join(UPLOAD_DIR, file_id + ext)
+    path = os.path.join(upload_dir(), file_id + ext)
     with open(path, "wb") as f:
         f.write(data)
 
@@ -274,7 +398,10 @@ async def start_run(req: RunRequest):
     if not jobs:
         raise HTTPException(400, "No companies found in that column")
 
-    config = _config_from(req)
+    try:
+        config = _config_from(req)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     settings = req.model_dump()
     label = req.label or f"{req.company_col} · {len(jobs)} companies"
     run_id = store.create_run(label, f"{active} ({raw_rows} rows)", len(jobs), settings)
@@ -283,7 +410,7 @@ async def start_run(req: RunRequest):
 
     async def execute() -> None:
         started = time.perf_counter()
-        cache = Cache(config.cache_path, config.cache_ttl, config.use_cache)
+        cache = None
 
         def on_event(event: dict) -> None:
             if event.get("type") == "company_start":
@@ -300,6 +427,7 @@ async def start_run(req: RunRequest):
                 })
 
         try:
+            cache = Cache(config.cache_path, config.cache_ttl, config.use_cache)
             await process_batch(
                 [j.as_row() for j in jobs], config,
                 on_event=on_event, cache=cache, store=store,
@@ -315,6 +443,8 @@ async def start_run(req: RunRequest):
             store.finish_run(run_id, "error", time.perf_counter() - started, str(exc))
             handle.publish({"type": "error", "message": str(exc)})
         finally:
+            if cache is not None:
+                cache.close()
             handle.finished = True
 
     handle.task = asyncio.create_task(execute())
@@ -376,6 +506,9 @@ async def get_run(run_id: str):
 
 @app.delete("/api/runs/{run_id}")
 async def delete_run(run_id: str):
+    handle = RUNS.get(run_id)
+    if handle and handle.task and not handle.task.done():
+        raise HTTPException(409, "Cancel this search before deleting it.")
     store.delete_run(run_id)
     RUNS.pop(run_id, None)
     return {"ok": True}

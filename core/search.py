@@ -55,9 +55,6 @@ class SearchClient:
         self.concurrency = SEARCH_CONCURRENCY[self.provider]
         self._sem = asyncio.Semaphore(self.concurrency)
         self._http: httpx.AsyncClient | None = None
-        # Queries that gave up after every retry. A run ending with a high
-        # count did not find "no companies" — it failed to search.
-        self.failures = 0
 
         # DDGS is synchronous, so it gets a pool of clients driven from threads.
         self._pool: queue.Queue = queue.Queue()
@@ -183,19 +180,10 @@ class SearchClient:
                     raise
                 except Exception as exc:
                     if attempt == MAX_ATTEMPTS - 1:
-                        # A configured backend that never answers is a setup
-                        # problem, not an absent company. DuckDuckGo is scraped
-                        # and flakes on individual queries, so it stays lenient.
-                        if self.provider != "ddg":
-                            raise SearchError(
-                                f"{self.provider} search failed after "
-                                f"{MAX_ATTEMPTS} attempts: {exc}. Check the "
-                                f"backend is running and reachable."
-                            ) from exc
-                        print(f"[!] Search failed for '{query}': {exc}")
-                        self.failures += 1
-                        rows = []
-                        break
+                        raise SearchError(
+                            f"{self.provider} search failed after {MAX_ATTEMPTS} attempts. "
+                            "Check your network and search settings, or try again later."
+                        ) from exc
                     # Exponential backoff with jitter; engines rate-limit bursts
                     await asyncio.sleep(1.5 * (2**attempt) + random.random())
 

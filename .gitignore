@@ -16,3 +16,12 @@ results_*.csv
 .claude
 *.xlsx
 *.csv
+.vscode
+
+# Windows packaging (never ignore the tracked PyInstaller spec or hash lock)
+/build/
+/dist/
+/.venv-build/
+/*smoke-result.json
+*.pfx
+*.p12

@@ -17,7 +17,9 @@ COPY main.py ./
 
 # Databases and uploads live here; the compose file mounts a volume over it
 RUN mkdir -p /data /app/.uploads
-ENV FINDER_CACHE_DIR=/data \
+ENV FINDER_HOME=/data \
+    FINDER_CACHE_DIR=/data \
+    FINDER_UPLOAD_DIR=/app/.uploads \
     FINDER_HOST=0.0.0.0 \
     FINDER_PORT=8765 \
     PYTHONUNBUFFERED=1

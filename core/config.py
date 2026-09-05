@@ -1,6 +1,9 @@
 import os
 from dataclasses import dataclass, field
 
+from core.paths import data_dir
+from core.settings import effective_settings
+
 # Concurrency / timing defaults
 DEFAULT_MAX_THREADS_COMPANIES = 5
 DEFAULT_MAX_PAGES = 10
@@ -8,17 +11,6 @@ DEFAULT_TIMEOUT = 12
 DEFAULT_PER_HOST_CONCURRENCY = 4
 DEFAULT_CACHE_TTL = 7 * 24 * 3600  # a week
 
-def data_dir() -> str:
-    """Where the SQLite files live.
-
-    Defaults to the project directory; a container overrides it with
-    FINDER_CACHE_DIR so the data survives on a mounted volume.
-    """
-    path = os.getenv("FINDER_CACHE_DIR") or os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__))
-    )
-    os.makedirs(path, exist_ok=True)
-    return path
 
 
 USER_AGENT = (
@@ -179,20 +171,10 @@ class Config:
         in ("1", "true", "yes")
     )
 
-    # Which search backend to use. "ddg" needs nothing; "searxng" points at a
-    # self-hosted instance (no API key, no per-query cost, and it federates
-    # several engines so recall is better); "brave"/"serper" need an API key.
-    search_provider: str = field(
-        default_factory=lambda: os.getenv("FINDER_SEARCH_PROVIDER", "ddg").lower()
-    )
-    # Base URL of the SearXNG instance. Its settings.yml must enable the JSON
-    # output format — `search: formats: [html, json]` — which is off by default.
-    searxng_url: str = field(
-        default_factory=lambda: os.getenv("FINDER_SEARXNG_URL", "http://127.0.0.1:8080")
-    )
-    search_api_key: str | None = field(
-        default_factory=lambda: os.getenv("FINDER_SEARCH_API_KEY")
-    )
+    # Explicit values override environment, saved settings, then defaults.
+    search_provider: str | None = None
+    searxng_url: str | None = None
+    search_api_key: str | None = field(default=None, repr=False)
 
     # How long a stored company result stays usable before it is looked up
     # again. Contact details drift slowly; three months is a sane refresh.
@@ -214,3 +196,9 @@ class Config:
     # merely mentions the company, and its contacts belong to someone else —
     # an empty row is worth more than a wrong one in a lead list.
     min_score: float = 30.0
+
+    def __post_init__(self) -> None:
+        settings = effective_settings()
+        for name in ("search_provider", "searxng_url", "search_api_key"):
+            if getattr(self, name) is None:
+                setattr(self, name, settings[name])
