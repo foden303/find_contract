@@ -481,7 +481,7 @@ and version tags. It builds:
 Each build runs regression tests and a frozen offline HTTP smoke scenario that
 covers session authentication, static UI, CSV upload, column planning, SQLite
 history, CSV/XLSX export, and clean shutdown. Version tags must exactly match
-`core.version.VERSION`, for example `v1.0.0`.
+`core.version.VERSION`, for example `v1.0.1`.
 
 A version tag is published only after every platform build succeeds. The release
 contains platform archives/installers, per-platform build provenance, and one

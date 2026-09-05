@@ -94,7 +94,6 @@ jobs:
           name: consumer-windows-x64
           path: |
             dist/release/*
-            frozen-smoke-result.json
           if-no-files-found: error
           retention-days: 14
 
@@ -162,7 +161,6 @@ jobs:
           name: consumer-macos-${{ matrix.arch }}
           path: |
             dist/release/*
-            macos-smoke-result.json
           if-no-files-found: error
           retention-days: 14
 
@@ -184,9 +182,22 @@ jobs:
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
-          for info in release/build-info-*.json; do test "$(jq -r .version "$info")" = "$version"; done
+          expected=(
+            "B2BContactFinder-$version-windows-x64-setup.exe"
+            "B2BContactFinder-$version-macos-arm64.zip"
+            "B2BContactFinder-$version-macos-x64.zip"
+            "build-info-windows-x64.json"
+            "build-info-macos-arm64.json"
+            "build-info-macos-x64.json"
+          )
+          for file in "${expected[@]}"; do
+            test -f "release/$file" || { echo "Missing release artifact: $file" >&2; exit 1; }
+          done
+          for info in release/build-info-*.json; do
+            test "$(jq -r .version "$info")" = "$version" || { echo "Version mismatch: $info" >&2; exit 1; }
+          done
           cd release
-          sha256sum B2BContactFinder-* build-info-*.json > SHA256SUMS.txt
+          sha256sum "${expected[@]}" > SHA256SUMS.txt
       - name: Publish validated Windows and macOS release
         env:
           GH_TOKEN: ${{ github.token }}
