@@ -132,11 +132,11 @@ DIRECTORY_HOSTS = {
 
 # --- Search providers ------------------------------------------------------
 
-# How many searches may be in flight at once, per provider. DuckDuckGo is
-# scraped rather than API-served and throttles hard; a self-hosted SearXNG is
-# limited only by your own machine and the engines it federates to.
+# How many logical searches may be in flight per provider. DDGS previously
+# fanned six logical searches into multiple upstream engines; explicit DDG at
+# three concurrent requests gives the public HTML endpoint sustainable pressure.
 SEARCH_CONCURRENCY = {
-    "ddg": 6,
+    "ddg": 3,
     "searxng": 16,
     "brave": 10,
     "serper": 10,
