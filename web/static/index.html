@@ -252,6 +252,8 @@
           <input type="number" id="minscore" value="30" min="0" max="100"></div>
         <div><label data-i18n="adv.delay">Delay (seconds)</label>
           <input type="number" id="delay" value="0" min="0" step="0.1"></div>
+        <div><label data-i18n="adv.timeout">Company deadline (seconds)</label>
+          <input type="number" id="company-timeout" value="75" min="10" max="180"></div>
         <div>
           <label data-i18n="adv.other">Other</label>
           <div style="font-size:12px">
@@ -338,7 +340,6 @@
           <option>25</option>
           <option selected>50</option>
           <option>100</option>
-          <option value="0" data-i18n="pg.all">All</option>
         </select>
       </label>
     </div>
@@ -374,7 +375,8 @@ const STRINGS = {
     's2.advanced': 'Advanced options', 's2.run': 'Start searching',
     'adv.threads': 'Parallel workers', 'adv.pages': 'Pages per site',
     'adv.candidates': 'Candidates per company', 'adv.minscore': 'Minimum score',
-    'adv.delay': 'Delay (seconds)', 'adv.other': 'Other', 'adv.cache': 'Cache',
+    'adv.delay': 'Delay (seconds)', 'adv.timeout': 'Company deadline (seconds)',
+    'adv.other': 'Other', 'adv.cache': 'Cache',
     'adv.guess': 'Guess emails', 'adv.tls': 'Skip TLS check',
     'adv.tls.hint': 'Only enable behind a TLS-inspecting proxy',
     'adv.merge': 'Merge all candidates',
@@ -459,7 +461,8 @@ const STRINGS = {
     's2.advanced': 'Tuỳ chọn nâng cao', 's2.run': 'Bắt đầu tìm',
     'adv.threads': 'Luồng song song', 'adv.pages': 'Trang mỗi site',
     'adv.candidates': 'Ứng viên mỗi cty', 'adv.minscore': 'Điểm tối thiểu',
-    'adv.delay': 'Giãn cách (giây)', 'adv.other': 'Khác', 'adv.cache': 'Cache',
+    'adv.delay': 'Giãn cách (giây)', 'adv.timeout': 'Giới hạn mỗi công ty (giây)',
+    'adv.other': 'Khác', 'adv.cache': 'Cache',
     'adv.guess': 'Đoán email', 'adv.tls': 'Bỏ qua kiểm TLS',
     'adv.tls.hint': 'Chỉ bật khi máy nằm sau proxy chặn TLS',
     'adv.merge': 'Gộp mọi ứng viên',
@@ -931,7 +934,9 @@ $('btn-run').onclick = async () => {
   const body = Object.assign(planBody(), {
     threads: +$('threads').value, max_pages: +$('maxpages').value,
     top_results: +$('topres').value, min_score: +$('minscore').value,
-    delay: +$('delay').value, use_cache: $('usecache').checked,
+    delay: +$('delay').value,
+    company_timeout: +$('company-timeout').value,
+    use_cache: $('usecache').checked,
     guess_emails: $('guess').checked, insecure_tls: $('insecure').checked,
     merge_sources: $('merge').checked, use_company_store: $('store').checked,
   });

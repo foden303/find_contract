@@ -13,6 +13,8 @@ import time
 DEFAULT_MAX_CACHE_BYTES = 512 * 1024 * 1024
 PRUNE_INTERVAL = 25
 PRUNE_TARGET_RATIO = 0.9
+WRITE_BATCH_SIZE = 25
+WRITE_BATCH_SECONDS = 0.25
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS http_cache (
@@ -46,6 +48,10 @@ class Cache:
         self.enabled = enabled
         self.max_bytes = max_bytes
         self._writes_since_prune = 0
+        self._pending_http: dict[str, tuple] = {}
+        self._pending_search: dict[str, tuple] = {}
+        self._pending_mx: dict[str, tuple] = {}
+        self._last_commit = time.monotonic()
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
         if enabled:
@@ -57,6 +63,47 @@ class Cache:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+    def _flush_if_needed_locked(self, force: bool = False) -> None:
+        count = (
+            len(self._pending_http)
+            + len(self._pending_search)
+            + len(self._pending_mx)
+        )
+        if not count:
+            return
+        if (
+            not force
+            and count < WRITE_BATCH_SIZE
+            and time.monotonic() - self._last_commit < WRITE_BATCH_SECONDS
+        ):
+            return
+        if self._pending_http:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO http_cache"
+                " (url, final_url, status, body, ts) VALUES (?, ?, ?, ?, ?)",
+                self._pending_http.values(),
+            )
+            self._pending_http.clear()
+        if self._pending_search:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO search_cache (key, payload, ts)"
+                " VALUES (?, ?, ?)",
+                self._pending_search.values(),
+            )
+            self._pending_search.clear()
+        if self._pending_mx:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO mx_cache (domain, has_mx, ts)"
+                " VALUES (?, ?, ?)",
+                self._pending_mx.values(),
+            )
+            self._pending_mx.clear()
+        self._writes_since_prune += count
+        if force or self._writes_since_prune >= PRUNE_INTERVAL:
+            self._prune_locked()
+        self._conn.commit()
+        self._last_commit = time.monotonic()
+
 
     def _used_database_bytes_locked(self) -> int:
         page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
@@ -86,6 +133,23 @@ class Cache:
                 break
         if to_remove:
             self._conn.executemany("DELETE FROM http_cache WHERE url = ?", to_remove)
+            required -= freed
+        if required > 0:
+            search_rows = self._conn.execute(
+                "SELECT key, length(CAST(payload AS BLOB)) + length(key)"
+                " FROM search_cache ORDER BY ts"
+            )
+            search_remove: list[tuple[str]] = []
+            freed = 0
+            for key, size in search_rows:
+                search_remove.append((key,))
+                freed += size
+                if freed >= required:
+                    break
+            if search_remove:
+                self._conn.executemany(
+                    "DELETE FROM search_cache WHERE key = ?", search_remove
+                )
 
     def _fresh(self, ts: float) -> bool:
         return (time.time() - ts) < self.ttl
@@ -96,26 +160,24 @@ class Cache:
         if not self.enabled or not self._conn:
             return None
         with self._lock:
-            row = self._conn.execute(
-                "SELECT final_url, status, body, ts FROM http_cache WHERE url = ?", (url,)
-            ).fetchone()
-        if not row or not self._fresh(row[3]):
+            row = self._pending_http.get(url)
+            if row is None:
+                row = self._conn.execute(
+                    "SELECT url, final_url, status, body, ts"
+                    " FROM http_cache WHERE url = ?", (url,)
+                ).fetchone()
+        if not row or not self._fresh(row[4]):
             return None
-        return row[0], row[1], row[2]
+        return row[1], row[2], row[3]
 
     def set_http(self, url: str, final_url: str, status: int, body: str | None) -> None:
         if not self.enabled or not self._conn:
             return
         with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO http_cache (url, final_url, status, body, ts)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (url, final_url, status, body, time.time()),
+            self._pending_http[url] = (
+                url, final_url, status, body, time.time()
             )
-            self._writes_since_prune += 1
-            if self._writes_since_prune >= PRUNE_INTERVAL:
-                self._prune_locked()
-            self._conn.commit()
+            self._flush_if_needed_locked()
 
     # --- Search ----------------------------------------------------------
 
@@ -123,13 +185,16 @@ class Cache:
         if not self.enabled or not self._conn:
             return None
         with self._lock:
-            row = self._conn.execute(
-                "SELECT payload, ts FROM search_cache WHERE key = ?", (key,)
-            ).fetchone()
-        if not row or not self._fresh(row[1]):
+            row = self._pending_search.get(key)
+            if row is None:
+                row = self._conn.execute(
+                    "SELECT key, payload, ts FROM search_cache WHERE key = ?",
+                    (key,),
+                ).fetchone()
+        if not row or not self._fresh(row[2]):
             return None
         try:
-            return json.loads(row[0])
+            return json.loads(row[1])
         except json.JSONDecodeError:
             return None
 
@@ -137,11 +202,10 @@ class Cache:
         if not self.enabled or not self._conn:
             return
         with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO search_cache (key, payload, ts) VALUES (?, ?, ?)",
-                (key, json.dumps(payload, ensure_ascii=False), time.time()),
+            self._pending_search[key] = (
+                key, json.dumps(payload, ensure_ascii=False), time.time()
             )
-            self._conn.commit()
+            self._flush_if_needed_locked()
 
     # --- MX lookups ------------------------------------------------------
 
@@ -149,25 +213,28 @@ class Cache:
         if not self.enabled or not self._conn:
             return None
         with self._lock:
-            row = self._conn.execute(
-                "SELECT has_mx, ts FROM mx_cache WHERE domain = ?", (domain,)
-            ).fetchone()
-        if not row or not self._fresh(row[1]):
+            row = self._pending_mx.get(domain)
+            if row is None:
+                row = self._conn.execute(
+                    "SELECT domain, has_mx, ts FROM mx_cache WHERE domain = ?",
+                    (domain,),
+                ).fetchone()
+        if not row or not self._fresh(row[2]):
             return None
-        return bool(row[0])
+        return bool(row[1])
 
     def set_mx(self, domain: str, has_mx: bool) -> None:
         if not self.enabled or not self._conn:
             return
         with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO mx_cache (domain, has_mx, ts) VALUES (?, ?, ?)",
-                (domain, int(has_mx), time.time()),
+            self._pending_mx[domain] = (
+                domain, int(has_mx), time.time()
             )
-            self._conn.commit()
+            self._flush_if_needed_locked()
 
     def close(self) -> None:
         if self._conn:
             with self._lock:
+                self._flush_if_needed_locked(force=True)
                 self._conn.close()
             self._conn = None

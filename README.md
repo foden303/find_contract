@@ -165,6 +165,11 @@ through DDGS meta-search. The engine starts with the two strongest queries and
 runs fallback queries only when those results do not identify a high-confidence
 first-party website. Shared cooldowns reduce sustained throttling.
 
+Search and crawling use separate bounded worker queues. A slow website therefore
+does not occupy a search worker. Identical queries and URLs share one in-flight
+request, repeated host failures open a per-run circuit breaker, and provider
+concurrency decreases after throttling before recovering gradually.
+
 On Windows, saved API keys are protected with the current Windows user's DPAPI
 credentials. API keys are never returned to browser JavaScript, placed in
 browser storage, or written into run history. Environment variables override
@@ -218,6 +223,7 @@ cinnamon, cassia, star anise
 | Candidates per company | 3 | maximum candidate websites scanned, best first |
 | Minimum score | 30 | candidates below this score are not scraped |
 | Delay | 0 | minimum delay between requests to one host |
+| Company deadline | 75 seconds | total search, crawl-queue and scrape budget; timed-out rows keep partial results |
 | Cache | enabled | reuse HTTP/search/MX results; persistent cache is capped near 512 MiB |
 | Guess emails | enabled | validate common role-address guesses through MX |
 | Merge all candidates | disabled | scan and combine every qualifying site |
@@ -268,6 +274,7 @@ Important fields include:
 | `sources` | candidate sites whose contacts contributed to the result |
 | `alternates` | other ranked candidates considered |
 | `notes` | cache, extraction, or row-level error information |
+| `performance` | persisted search, queue, crawl, cache, retry and timeout counters in milliseconds/counts |
 
 A high confidence score means the website is likely to belong to the requested
 company. It does not verify that every contact is currently active. Guessed
@@ -431,6 +438,20 @@ Spreadsheet:
 
 Use `./venv/bin/python main.py --help` for all CLI options.
 
+## Search quality benchmark
+
+The live benchmark compares selected domains against ten labeled global
+companies and reports accuracy, query count, network requests, mean latency, and
+P95 latency. It uses a temporary cold cache and does not behave as a deterministic
+regression test:
+
+```bash
+./venv/bin/python -m benchmarks.query_quality --provider ddg
+```
+
+Use `--limit 3` for a short smoke run. Brave and Serper use the API key from the
+saved search settings or `FINDER_SEARCH_API_KEY`.
+
 ## Build desktop packages
 
 Release builds use Python `3.12.10` and hash-locked binary dependencies.
@@ -487,7 +508,7 @@ and version tags. It builds:
 Each build runs regression tests and a frozen offline HTTP smoke scenario that
 covers session authentication, static UI, CSV upload, column planning, SQLite
 history, CSV/XLSX export, and clean shutdown. Version tags must exactly match
-`core.version.VERSION`, for example `v1.0.1`.
+`core.version.VERSION`, for example `v1.0.3`.
 
 A version tag is published only after every platform build succeeds. The release
 contains platform archives/installers, per-platform build provenance, and one

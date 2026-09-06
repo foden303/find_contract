@@ -158,6 +158,7 @@ class RunRequest(PlanRequest):
     top_results: int = 3
     min_score: float = 30.0
     delay: float = 0.0
+    company_timeout: float = 75.0
     use_cache: bool = True
     guess_emails: bool = True
     early_exit: bool = True
@@ -214,6 +215,7 @@ def _config_from(req: RunRequest) -> Config:
         top_results=max(1, min(req.top_results, 8)),
         min_score=req.min_score,
         delay=max(0.0, req.delay),
+        company_timeout=max(10.0, min(req.company_timeout, 180.0)),
         use_cache=req.use_cache,
         guess_emails=req.guess_emails,
         early_exit=req.early_exit,
@@ -240,7 +242,7 @@ RESULT_COLUMNS = [
     ("products", "Products"), ("pages_scanned", "Pages scanned"),
     ("address", "Address"), ("address_confirmed", "Address confirmed"),
     ("sources", "Sites scraped"), ("alternates", "Other candidates"),
-    ("elapsed", "Seconds"),
+    ("elapsed", "Seconds"), ("performance", "Performance"),
 ]
 
 
@@ -252,6 +254,8 @@ def _flatten(row: dict) -> list[str]:
             out.append(" | ".join(str(v) for v in value))
         elif isinstance(value, float):
             out.append(f"{value:.1f}")
+        elif isinstance(value, dict):
+            out.append(json.dumps(value, ensure_ascii=False, sort_keys=True))
         else:
             out.append("" if value is None else str(value))
     return out
@@ -428,13 +432,21 @@ async def start_run(req: RunRequest):
 
         try:
             cache = Cache(config.cache_path, config.cache_ttl, config.use_cache)
-            await process_batch(
+            results = await process_batch(
                 [j.as_row() for j in jobs], config,
                 on_event=on_event, cache=cache, store=store,
             )
             elapsed = time.perf_counter() - started
+            totals: dict[str, float] = {}
+            for result in results:
+                for key, value in result.performance.items():
+                    if isinstance(value, (int, float)):
+                        totals[key] = round(totals.get(key, 0) + value, 2)
+            totals["companies"] = len(results)
             store.finish_run(run_id, "done", elapsed)
-            handle.publish({"type": "done", "elapsed": elapsed})
+            handle.publish({
+                "type": "done", "elapsed": elapsed, "performance": totals,
+            })
         except asyncio.CancelledError:
             store.finish_run(run_id, "cancelled", time.perf_counter() - started)
             handle.publish({"type": "cancelled"})

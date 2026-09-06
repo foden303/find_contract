@@ -1,0 +1,12 @@
+[
+  {"company": "OpenAI", "country": "United States", "products": ["artificial intelligence"], "expected_domain": "openai.com"},
+  {"company": "Microsoft Corporation", "country": "United States", "products": ["software"], "expected_domain": "microsoft.com"},
+  {"company": "Apple Inc", "country": "United States", "products": ["consumer electronics"], "expected_domain": "apple.com"},
+  {"company": "NVIDIA Corporation", "country": "United States", "products": ["semiconductors"], "expected_domain": "nvidia.com"},
+  {"company": "DHL Group", "country": "Germany", "products": ["logistics"], "expected_domains": ["dhl.com", "dhl.de"]},
+  {"company": "Siemens AG", "country": "Germany", "products": ["industrial automation"], "expected_domain": "siemens.com"},
+  {"company": "Samsung Electronics", "country": "South Korea", "products": ["electronics"], "expected_domain": "samsung.com"},
+  {"company": "Nestle", "country": "Switzerland", "products": ["food and beverages"], "expected_domain": "nestle.com"},
+  {"company": "Caterpillar Inc", "country": "United States", "products": ["construction equipment"], "expected_domain": "caterpillar.com"},
+  {"company": "Pfizer Inc", "country": "United States", "products": ["pharmaceuticals"], "expected_domain": "pfizer.com"}
+]

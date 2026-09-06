@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from core.cache import Cache
@@ -128,10 +129,13 @@ async def _select_candidates(
     config: Config,
     search: SearchClient,
     locality: str = "",
+    telemetry: dict | None = None,
 ) -> list[Candidate]:
     queries = build_company_queries(query, country, products, locality)
     primary = queries[:2]
-    found = await search.search_many(primary, limit=8, country=country)
+    found = await search.search_many(
+        primary, limit=8, country=country, telemetry=telemetry
+    )
     ranked = rank_candidates(found, query, country, products, locality) if found else []
 
     sufficient_score = max(config.min_score, SEARCH_EXPANSION_SCORE)
@@ -146,7 +150,9 @@ async def _select_candidates(
     fallback = queries[2:]
     if not fallback:
         return ranked
-    additional = await search.search_many(fallback, limit=8, country=country)
+    additional = await search.search_many(
+        fallback, limit=8, country=country, telemetry=telemetry
+    )
     merged = {candidate.url: candidate for candidate in found}
     for candidate in additional:
         merged.setdefault(candidate.url, candidate)
@@ -167,7 +173,7 @@ async def _scan_site(
 ) -> None:
     """Fetch a candidate's homepage plus its best contact pages."""
     page_budget = config.max_pages if max_pages is None else max_pages
-    home = await fetcher.get(cand.url)
+    home = await fetcher.get(cand.url, telemetry=res.performance)
     if not home.ok:
         res.notes.append(f"unreachable: {cand.url}")
         return
@@ -200,7 +206,7 @@ async def _scan_site(
     wave_size = 2
     for offset in range(0, len(pages), wave_size):
         pending = {
-            asyncio.create_task(fetcher.get(url))
+            asyncio.create_task(fetcher.get(url, telemetry=res.performance))
             for url in pages[offset : offset + wave_size]
         }
         try:
@@ -233,6 +239,278 @@ async def _scan_site(
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
 
+@dataclass
+class _CompanyWork:
+    query: str
+    country: str | None
+    products: list[str]
+    address: str | None
+    started: float
+    deadline_at: float
+    region: str | None
+    locality: str
+    res: Result
+    collected: ContactExtract = field(default_factory=ContactExtract)
+    candidates: list[Candidate] = field(default_factory=list)
+    scannable: list[Candidate] = field(default_factory=list)
+    best: Candidate | None = None
+    complete: bool = False
+    timed_out: bool = False
+    consolidated: bool = False
+
+
+def _new_company_work(
+    query: str,
+    country: str | None,
+    products: list[str],
+    address: str | None,
+    config: Config,
+) -> _CompanyWork:
+    loop = asyncio.get_running_loop()
+    started = time.perf_counter()
+    locality = extract_locality(address or "", country)
+    return _CompanyWork(
+        query=query,
+        country=country,
+        products=products,
+        address=address,
+        started=started,
+        deadline_at=loop.time() + max(0.1, config.company_timeout),
+        region=region_for_country(country),
+        locality=locality,
+        res=Result(
+            query=query, country=country, products=products, address=address
+        ),
+    )
+
+
+async def _prepare_company(
+    work: _CompanyWork, config: Config, search: SearchClient
+) -> None:
+    phase_started = time.perf_counter()
+    try:
+        if is_domain_like(work.query):
+            url = normalize_url(work.query)
+            work.candidates = [
+                Candidate(
+                    url=url, title=work.query, score=100.0,
+                    reasons=["direct domain"],
+                )
+            ]
+            work.res.company = extract_domain(url).split(".")[0].capitalize()
+            work.res.is_direct_hit = True
+        else:
+            work.res.company = work.query
+            work.candidates = await _select_candidates(
+                work.query,
+                work.country,
+                work.products,
+                config,
+                search,
+                work.locality,
+                telemetry=work.res.performance,
+            )
+    finally:
+        work.res.performance["search_ms"] = round(
+            (time.perf_counter() - phase_started) * 1000, 2
+        )
+
+    if not work.candidates:
+        work.res.notes.append("no search results")
+        work.complete = True
+        return
+
+    best = work.candidates[0]
+    work.best = best
+    work.res.website = best.url
+    work.res.confidence = round(best.score, 1)
+    work.res.match_reason = list(best.reasons)
+    work.res.alternates = [
+        f"{candidate.score:.0f} {candidate.url}"
+        for candidate in work.candidates[1:4]
+    ]
+
+    above_bar = [
+        candidate
+        for candidate in work.candidates
+        if candidate.score >= config.min_score
+    ]
+    if config.merge_sources:
+        by_domain: dict[str, Candidate] = {}
+        for candidate in above_bar:
+            domain = extract_domain(candidate.url)
+            if domain not in by_domain:
+                by_domain[domain] = candidate
+        merged = list(by_domain.values())
+        own = [
+            candidate
+            for candidate in merged
+            if candidate is best
+            or name_similarity(
+                work.query, domain_core(candidate.url)
+            ) >= MERGE_NAME_FLOOR
+        ]
+        kept_ids = {id(candidate) for candidate in own}
+        skipped = [
+            candidate for candidate in merged if id(candidate) not in kept_ids
+        ]
+        if skipped:
+            work.res.notes.append(
+                "merge skipped unrelated domains: "
+                + ", ".join(extract_domain(candidate.url) for candidate in skipped[:5])
+            )
+        above_bar = own
+
+    work.scannable = above_bar[: config.top_results]
+    if not work.scannable:
+        work.res.match_reason.append(
+            f"below threshold ({best.score:.0f} < {config.min_score:.0f}) — not scanned"
+        )
+        work.res.notes.append(
+            "weak match: verify the website by hand before using it"
+        )
+        work.complete = True
+
+
+def _consolidate_contacts(work: _CompanyWork) -> None:
+    if work.consolidated or work.best is None:
+        return
+    work.consolidated = True
+    res = work.res
+    collected = work.collected
+    scanned_domains = {
+        extract_domain(source.split(" ", 1)[-1]) for source in res.sources
+    }
+    if res.website:
+        scanned_domains.add(extract_domain(res.website))
+    scanned_domains.discard("")
+    kept, rejected = _filter_emails(
+        collected.emails, scanned_domains, res.confidence
+    )
+    if rejected:
+        res.notes.append(f"ignored off-domain emails: {', '.join(rejected[:5])}")
+
+    res.emails = kept
+    res.phones = sorted(collected.phones)
+    res.social_links = sorted(collected.social_links)
+    res.whatsapp_links = sorted(collected.whatsapp_links)
+    res.whatsapp_numbers = sorted(collected.whatsapp_numbers)
+    res.whatsapp_verified = sorted(collected.whatsapp_numbers)
+    res.priority_emails, res.emails = prioritize_emails(res.emails)
+
+    if work.best.is_directory:
+        res.match_reason.append("directory listing, not the company's own site")
+
+
+async def _crawl_company(
+    work: _CompanyWork, config: Config, fetcher: Fetcher
+) -> None:
+    phase_started = time.perf_counter()
+    try:
+        try:
+            for rank, candidate in enumerate(work.scannable):
+                work.collected.merge(
+                    _contacts_from_snippet(candidate.snippet, work.region)
+                )
+                if candidate.snippet:
+                    work.res.notes.append(
+                        f"snippet[{extract_domain(candidate.url)}]: "
+                        f"{candidate.snippet[:180]}"
+                    )
+                if candidate.is_snippet_only:
+                    continue
+
+                if rank > 0 and not config.merge_sources:
+                    if work.collected.emails or work.collected.phones:
+                        break
+                    if candidate.score < work.best.score - 25:
+                        work.res.notes.append(
+                            f"skipped weaker candidate {candidate.url}"
+                        )
+                        break
+
+                budget = (
+                    config.max_pages
+                    if config.merge_sources or rank == 0
+                    else max(3, config.max_pages // 3)
+                )
+                await _scan_site(
+                    candidate,
+                    config,
+                    fetcher,
+                    work.region,
+                    work.collected,
+                    work.res,
+                    budget,
+                    work.locality,
+                )
+                work.res.sources.append(
+                    f"{candidate.score:.0f} {candidate.url}"
+                )
+
+                if config.early_exit and not config.merge_sources:
+                    priority, _ = prioritize_emails(
+                        sorted(work.collected.emails)
+                    )
+                    if priority and work.collected.phones:
+                        break
+        finally:
+            # A deadline may interrupt the crawl after useful pages completed.
+            # Preserve those contacts instead of turning a timeout into an
+            # apparently empty company.
+            _consolidate_contacts(work)
+
+        own_site = (
+            bool(work.res.website)
+            and not work.best.is_directory
+            and not work.best.is_snippet_only
+        )
+        if (
+            config.guess_emails
+            and own_site
+            and work.res.confidence >= 40
+            and not work.res.priority_emails
+            and not work.res.emails
+        ):
+            domain = extract_domain(work.res.website)
+            work.res.guessed_emails = await guess_emails(
+                domain,
+                set(work.res.emails) | set(work.res.priority_emails),
+                fetcher.cache,
+            )
+            if work.res.guessed_emails:
+                work.res.notes.append(f"guessed from MX record of {domain}")
+    finally:
+        work.res.performance["crawl_ms"] = round(
+            (time.perf_counter() - phase_started) * 1000, 2
+        )
+
+
+async def _run_before_deadline(
+    work: _CompanyWork, operation: Callable[[], Awaitable[None]]
+) -> None:
+    remaining = work.deadline_at - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise TimeoutError
+    async with asyncio.timeout(remaining):
+        await operation()
+
+
+def _mark_timed_out(work: _CompanyWork, config: Config) -> None:
+    work.timed_out = True
+    work.res.performance["timed_out"] = 1
+    work.res.notes.append(
+        f"timed out after {config.company_timeout:g}s; partial result retained"
+    )
+    _consolidate_contacts(work)
+
+
+def _finish_work(work: _CompanyWork) -> Result:
+    work.res.elapsed = time.perf_counter() - work.started
+    work.res.performance["total_ms"] = round(work.res.elapsed * 1000, 2)
+    return work.res
+
+
 
 async def scan_company(
     query: str,
@@ -244,159 +522,25 @@ async def scan_company(
     address: str | None = None,
     on_event: ProgressFn | None = None,
 ) -> Result:
-    started = time.perf_counter()
-    products = products or []
-    region = region_for_country(country)
-    # A full postal address is useless as a search term, but the city it
-    # contains both sharpens the query and confirms a match on the page.
-    locality = extract_locality(address or "", country)
-    res = Result(query=query, country=country, products=products, address=address)
-    collected = ContactExtract()
-
+    work = _new_company_work(
+        query, country, products or [], address, config
+    )
     await _emit(on_event, {"type": "company_start", "query": query})
-
-    # 1. Work out which site(s) to scan
-    if is_domain_like(query):
-        url = normalize_url(query)
-        candidates = [Candidate(url=url, title=query, score=100.0, reasons=["direct domain"])]
-        res.company = extract_domain(url).split(".")[0].capitalize()
-        res.is_direct_hit = True
-    else:
-        res.company = query
-        candidates = await _select_candidates(
-            query, country, products, config, search, locality
+    try:
+        await _run_before_deadline(
+            work, lambda: _prepare_company(work, config, search)
         )
-
-    if not candidates:
-        res.notes.append("no search results")
-        res.elapsed = time.perf_counter() - started
-        await _emit(on_event, {"type": "company_done", "query": query, "result": res})
-        return res
-
-    best = candidates[0]
-    res.website = best.url
-    res.confidence = round(best.score, 1)
-    res.match_reason = list(best.reasons)
-    res.alternates = [f"{c.score:.0f} {c.url}" for c in candidates[1:4]]
-
-    # Below the bar the best hit is a directory or an article that merely
-    # mentions the company. Record it as a lead to check by hand, but do not
-    # scrape it — its emails and phones belong to somebody else.
-    above_bar = [c for c in candidates if c.score >= config.min_score]
-    if config.merge_sources:
-        # Search often returns three pages of one site. Merging those is not
-        # "several sources", so keep the best-scoring hit per registrable
-        # domain — the site's own crawl already covers its other pages.
-        by_domain: dict[str, Candidate] = {}
-        for cand in above_bar:
-            domain = extract_domain(cand.url)
-            if domain not in by_domain:
-                by_domain[domain] = cand
-        merged = list(by_domain.values())
-
-        # Only merge from domains that plausibly belong to this company. A
-        # listings site can clear min_score on country and product alone, and
-        # scraping it hands back its own support inbox as the company's. There
-        # are far too many such sites to blacklist by hand, so test the name.
-        own = [
-            c for c in merged
-            if c is best or name_similarity(query, domain_core(c.url)) >= MERGE_NAME_FLOOR
-        ]
-        kept_ids = {id(c) for c in own}
-        skipped = [c for c in merged if id(c) not in kept_ids]
-        if skipped:
-            res.notes.append(
-                "merge skipped unrelated domains: "
-                + ", ".join(extract_domain(c.url) for c in skipped[:5])
+        if not work.complete:
+            await _run_before_deadline(
+                work, lambda: _crawl_company(work, config, fetcher)
             )
-        above_bar = own
-    scannable = above_bar[: config.top_results]
-    if not scannable:
-        res.match_reason.append(
-            f"below threshold ({best.score:.0f} < {config.min_score:.0f}) — not scanned"
-        )
-        res.notes.append("weak match: verify the website by hand before using it")
-        res.elapsed = time.perf_counter() - started
-        await _emit(on_event, {"type": "company_done", "query": query, "result": res})
-        return res
-
-    # 2. Harvest each candidate, best first
-    scanned_domains: set[str] = set()
-    for rank, cand in enumerate(scannable):
-        collected.merge(_contacts_from_snippet(cand.snippet, region))
-        if cand.snippet:
-            res.notes.append(f"snippet[{extract_domain(cand.url)}]: {cand.snippet[:180]}")
-
-        if cand.is_snippet_only:
-            continue
-
-        if rank > 0 and not config.merge_sources:
-            # Runners-up are only worth the round trips when the best result
-            # came back empty, and never when they score far below it.
-            if collected.emails or collected.phones:
-                break
-            if cand.score < best.score - 25:
-                res.notes.append(f"skipped weaker candidate {cand.url}")
-                break
-
-        # In merge mode every candidate gets the full budget, because each one
-        # is a source in its own right rather than a fallback.
-        if config.merge_sources:
-            budget = config.max_pages
-        else:
-            budget = config.max_pages if rank == 0 else max(3, config.max_pages // 3)
-
-        await _scan_site(cand, config, fetcher, region, collected, res, budget, locality)
-        res.sources.append(f"{cand.score:.0f} {cand.url}")
-        scanned_domains.add(extract_domain(cand.url))
-
-        if config.early_exit and not config.merge_sources:
-            priority, _ = prioritize_emails(sorted(collected.emails))
-            if priority and collected.phones:
-                break
-
-    # 3. Consolidate, dropping addresses that belong to somebody else
-    if res.website:
-        scanned_domains.add(extract_domain(res.website))
-    scanned_domains.discard("")
-    kept, rejected = _filter_emails(collected.emails, scanned_domains, res.confidence)
-    if rejected:
-        res.notes.append(f"ignored off-domain emails: {', '.join(rejected[:5])}")
-
-    res.emails = kept
-    res.phones = sorted(collected.phones)
-    res.social_links = sorted(collected.social_links)
-    res.whatsapp_links = sorted(collected.whatsapp_links)
-    res.whatsapp_numbers = sorted(collected.whatsapp_numbers)
-    # "Verified" now means exactly one thing: the number came from a real
-    # WhatsApp link on the site, not a guess about its country code.
-    res.whatsapp_verified = sorted(collected.whatsapp_numbers)
-    res.priority_emails, res.emails = prioritize_emails(res.emails)
-
-    # 4. Fall back to pattern-guessed addresses only when we found none, and
-    #    only on what looks like the company's own domain — guessing
-    #    info@ on a directory just yields the directory's own inbox.
-    own_site = bool(res.website) and not best.is_directory and not best.is_snippet_only
-    if best.is_directory:
-        res.match_reason.append("directory listing, not the company's own site")
-
-    if (
-        config.guess_emails
-        and own_site
-        and res.confidence >= 40
-        and not res.priority_emails
-        and not res.emails
-    ):
-        domain = extract_domain(res.website)
-        res.guessed_emails = await guess_emails(
-            domain, set(res.emails) | set(res.priority_emails), fetcher.cache
-        )
-        if res.guessed_emails:
-            res.notes.append(f"guessed from MX record of {domain}")
-
-    res.elapsed = time.perf_counter() - started
-    await _emit(on_event, {"type": "company_done", "query": query, "result": res})
-    return res
+    except TimeoutError:
+        _mark_timed_out(work, config)
+    result = _finish_work(work)
+    await _emit(
+        on_event, {"type": "company_done", "query": query, "result": result}
+    )
+    return result
 
 
 async def process_batch(
@@ -406,78 +550,189 @@ async def process_batch(
     cache: Cache | None = None,
     store=None,
 ) -> list[Result]:
-    """Scan many companies concurrently, preserving input order in the output."""
+    """Run bounded search and crawl stages while preserving input order."""
     if not rows:
         return []
 
     owns_cache = cache is None
     cache = cache or Cache(config.cache_path, config.cache_ttl, config.use_cache)
-    search = None
-    tasks = []
+    search: SearchClient | None = None
+    stage_tasks: list[asyncio.Task] = []
     try:
         search = SearchClient(config, cache)
-        sem = asyncio.Semaphore(config.max_threads_companies)
         total = len(rows)
+        results: list[Result | None] = [None] * total
         done = 0
-        lock = asyncio.Lock()
+        progress_lock = asyncio.Lock()
+        search_worker_count = min(
+            total, max(1, min(config.max_threads_companies, search.concurrency))
+        )
+        crawl_worker_count = min(total, max(1, config.max_threads_companies))
+        input_queue: asyncio.Queue = asyncio.Queue()
+        crawl_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=max(2, crawl_worker_count * 2)
+        )
+        enqueued_at = asyncio.get_running_loop().time()
+        for index, row in enumerate(rows):
+            input_queue.put_nowait((index, row, enqueued_at))
+        for _ in range(search_worker_count):
+            input_queue.put_nowait(None)
 
         async with Fetcher(config, cache) as fetcher:
-
-            async def one(index: int, row: tuple) -> Result:
+            async def finish(
+                index: int,
+                result: Result,
+                company_key: str = "",
+                save_company: bool = False,
+            ) -> None:
                 nonlocal done
-                name, country, products, *extra = row
-                address = extra[0] if extra else None
-                key = dedupe_key(name) if store and config.use_company_store else ""
-                if key:
-                    remembered = store.get_company(key, config.company_ttl)
-                    if remembered:
-                        res = Result(**remembered)
-                        res.notes.append("from company store")
-                        res.elapsed = 0.0
-                        async with lock:
-                            done += 1
-                            position = done
-                        await _emit(on_event, {
-                            "type": "progress", "index": index,
-                            "done": position, "total": total, "result": res,
-                        })
-                        return res
+                if save_company and company_key:
+                    store.save_company(company_key, result)
+                results[index] = result
+                await _emit(
+                    on_event,
+                    {
+                        "type": "company_done",
+                        "query": result.query,
+                        "result": result,
+                    },
+                )
+                async with progress_lock:
+                    done += 1
+                    position = done
+                await _emit(
+                    on_event,
+                    {
+                        "type": "progress",
+                        "index": index,
+                        "done": position,
+                        "total": total,
+                        "result": result,
+                    },
+                )
 
-                async with sem:
+            async def search_worker() -> None:
+                while True:
+                    item = await input_queue.get()
+                    if item is None:
+                        return
+                    index, row, queued_at = item
+                    name, country, products, *extra = row
+                    address = extra[0] if extra else None
+                    queue_ms = round(
+                        (
+                            asyncio.get_running_loop().time()
+                            - queued_at
+                        ) * 1000,
+                        2,
+                    )
+                    key = (
+                        dedupe_key(name)
+                        if store and config.use_company_store else ""
+                    )
+                    if key:
+                        remembered = store.get_company(
+                            key, config.company_ttl
+                        )
+                        if remembered:
+                            result = Result(**remembered)
+                            result.notes.append("from company store")
+                            result.elapsed = 0.0
+                            result.performance = {
+                                "company_queue_ms": queue_ms,
+                                "company_store_hit": 1,
+                                "total_ms": 0.0,
+                            }
+                            await finish(index, result)
+                            continue
+
+                    work = _new_company_work(
+                        name, country, products, address, config
+                    )
+                    work.res.performance["company_queue_ms"] = queue_ms
+                    await _emit(
+                        on_event, {"type": "company_start", "query": name}
+                    )
                     try:
-                        res = await scan_company(
-                            name, config, fetcher, search,
-                            country=country, products=products, address=address,
-                            on_event=on_event,
+                        await _run_before_deadline(
+                            work,
+                            lambda: _prepare_company(work, config, search),
                         )
                     except SearchError:
                         raise
+                    except TimeoutError:
+                        _mark_timed_out(work, config)
+                        await finish(index, _finish_work(work))
                     except Exception as exc:
-                        res = Result(query=name, company=name, country=country,
-                                     products=products, address=address)
-                        res.notes.append(f"error: {exc}")
+                        work.res.performance["failed"] = 1
+                        work.res.notes.append(f"error: {exc}")
+                        await finish(index, _finish_work(work))
                     else:
-                        if key:
-                            store.save_company(key, res)
-                async with lock:
-                    done += 1
-                    position = done
-                await _emit(on_event, {
-                    "type": "progress", "index": index,
-                    "done": position, "total": total, "result": res,
-                })
-                return res
+                        if work.complete:
+                            await finish(
+                                index, _finish_work(work), key, bool(key)
+                            )
+                        else:
+                            await crawl_queue.put(
+                                (
+                                    index,
+                                    work,
+                                    key,
+                                    asyncio.get_running_loop().time(),
+                                )
+                            )
 
-            tasks = [asyncio.create_task(one(i, row)) for i, row in enumerate(rows)]
+            async def crawl_worker() -> None:
+                while True:
+                    item = await crawl_queue.get()
+                    if item is None:
+                        return
+                    index, work, key, queued_at = item
+                    work.res.performance["crawl_queue_ms"] = round(
+                        (
+                            asyncio.get_running_loop().time()
+                            - queued_at
+                        ) * 1000,
+                        2,
+                    )
+                    save = bool(key)
+                    try:
+                        await _run_before_deadline(
+                            work,
+                            lambda: _crawl_company(work, config, fetcher),
+                        )
+                    except TimeoutError:
+                        _mark_timed_out(work, config)
+                        save = False
+                    except Exception as exc:
+                        work.res.performance["failed"] = 1
+                        work.res.notes.append(f"error: {exc}")
+                        save = False
+                    await finish(
+                        index, _finish_work(work), key, save
+                    )
+
+            search_tasks = [
+                asyncio.create_task(search_worker())
+                for _ in range(search_worker_count)
+            ]
+            crawl_tasks = [
+                asyncio.create_task(crawl_worker())
+                for _ in range(crawl_worker_count)
+            ]
+            stage_tasks = search_tasks + crawl_tasks
             try:
-                return list(await asyncio.gather(*tasks))
+                await asyncio.gather(*search_tasks)
+                for _ in range(crawl_worker_count):
+                    await crawl_queue.put(None)
+                await asyncio.gather(*crawl_tasks)
             finally:
-                # gather does not stop siblings when one raises. Drain them
-                # before closing the Fetcher, cache or application Store.
-                for task in tasks:
+                for task in stage_tasks:
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*stage_tasks, return_exceptions=True)
+
+        return [result for result in results if result is not None]
     finally:
         if search is not None:
             await search.aclose()

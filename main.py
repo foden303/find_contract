@@ -10,6 +10,7 @@ from dataclasses import asdict
 
 from core.cache import Cache
 from core.config import (
+    DEFAULT_COMPANY_TIMEOUT,
     DEFAULT_MAX_PAGES,
     DEFAULT_MAX_THREADS_COMPANIES,
     Config,
@@ -27,7 +28,7 @@ CSV_FIELDS = [
     "match_reason", "priority_emails", "emails", "guessed_emails",
     "phones", "whatsapp_numbers", "whatsapp_links", "social_links",
     "address", "address_confirmed", "pages_scanned", "sources",
-    "alternates", "elapsed_sec", "notes",
+    "alternates", "elapsed_sec", "performance", "notes",
 ]
 
 
@@ -47,6 +48,10 @@ def parse_args(argv: list[str]):
                    help="Max search candidates to scan per company")
     p.add_argument("--delay", type=float, default=0.0,
                    help="Minimum seconds between requests to the same host")
+    p.add_argument(
+        "--company-timeout", type=float, default=DEFAULT_COMPANY_TIMEOUT,
+        help="End-to-end seconds allowed per company after it leaves the queue",
+    )
     p.add_argument("--min-score", type=float, default=30.0,
                    help="Minimum relevance score (0-100) for a candidate to be scanned")
     p.add_argument("--no-cache", action="store_true", help="Bypass the local SQLite cache")
@@ -107,6 +112,7 @@ def write_csv(results: list[Result], out_path: str) -> None:
                 "sources": " | ".join(r.sources),
                 "alternates": " | ".join(r.alternates),
                 "elapsed_sec": f"{r.elapsed:.1f}",
+                "performance": json.dumps(r.performance, sort_keys=True),
                 "notes": " | ".join(r.notes),
             })
 
@@ -145,6 +151,7 @@ async def run(args) -> list[Result]:
         max_threads_companies=args.threads,
         max_pages=args.max_pages,
         delay=args.delay,
+        company_timeout=max(0.1, args.company_timeout),
         top_results=args.top_results,
         min_score=args.min_score,
         use_cache=not args.no_cache,

@@ -11,6 +11,7 @@ from core.config import Config, USER_AGENT
 from core.utils import host_of
 
 MAX_BODY_BYTES = 2_000_000  # a contact page is never bigger than this
+CIRCUIT_FAILURE_THRESHOLD = 2
 
 _HEADERS = {
     "User-Agent": USER_AGENT,
@@ -27,6 +28,7 @@ class FetchResult:
     status: int
     html: str | None
     from_cache: bool = False
+    error: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -43,6 +45,13 @@ class Fetcher:
         self._last_hit: dict[str, float] = defaultdict(float)
         self._delay_locks: dict[str, asyncio.Lock] = {}
         self._client: httpx.AsyncClient | None = None
+        self._inflight: dict[str, asyncio.Task] = {}
+        self._host_failures: dict[str, int] = defaultdict(int)
+        self._blocked_hosts: set[str] = set()
+        self.stats = {
+            "requests": 0, "cache_hits": 0, "inflight_joins": 0,
+            "circuits_opened": 0,
+        }
 
     async def __aenter__(self) -> "Fetcher":
         total = max(20, self.config.max_threads_companies * self.config.per_host_concurrency)
@@ -61,6 +70,13 @@ class Fetcher:
         return self
 
     async def __aexit__(self, *exc) -> None:
+        pending = list(self._inflight.values())
+        self._inflight.clear()
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -84,24 +100,78 @@ class Fetcher:
                 await asyncio.sleep(wait)
             self._last_hit[host] = loop.time()
 
-    async def get(self, url: str) -> FetchResult:
+    @staticmethod
+    def _add_metric(metrics: dict | None, key: str, value: float | int = 1) -> None:
+        if metrics is not None:
+            metrics[key] = metrics.get(key, 0) + value
+
+    def _record_host_result(self, host: str, result: FetchResult) -> None:
+        failed = (
+            result.status == 0
+            or result.status in (403, 429)
+            or result.status >= 500
+        )
+        if not failed:
+            self._host_failures.pop(host, None)
+            return
+        self._host_failures[host] += 1
+        if (
+            self._host_failures[host] >= CIRCUIT_FAILURE_THRESHOLD
+            and host not in self._blocked_hosts
+        ):
+            self._blocked_hosts.add(host)
+            self.stats["circuits_opened"] += 1
+
+    async def _fetch_and_cache(self, url: str, host: str) -> FetchResult:
+        async with self._host_sem(host):
+            await self._respect_delay(host)
+            self.stats["requests"] += 1
+            result = await self._get_uncached(url)
+        self._record_host_result(host, result)
+        self.cache.set_http(url, result.final_url, result.status, result.html)
+        return result
+
+    async def get(self, url: str, telemetry: dict | None = None) -> FetchResult:
+        self._add_metric(telemetry, "http_requests")
         cached = self.cache.get_http(url)
         if cached is not None:
             final_url, status, body = cached
+            self.stats["cache_hits"] += 1
+            self._add_metric(telemetry, "http_cache_hits")
             return FetchResult(url, final_url, status, body, from_cache=True)
 
         if self._client is None:
             raise RuntimeError("Fetcher must be used as an async context manager")
 
         host = host_of(url)
-        async with self._host_sem(host):
-            await self._respect_delay(host)
-            result = await self._get_uncached(url)
+        if host in self._blocked_hosts:
+            self._add_metric(telemetry, "http_circuit_skips")
+            return FetchResult(url, url, 0, None, error="circuit_open")
 
-        # Cache failures too, but briefly is not worth the complexity: a dead
-        # host stays dead for the TTL, which is what we want during batch runs.
-        self.cache.set_http(url, result.final_url, result.status, result.html)
-        return result
+        task = self._inflight.get(url)
+        owner = task is None
+        if owner:
+            task = asyncio.create_task(self._fetch_and_cache(url, host))
+            self._inflight[url] = task
+        else:
+            self.stats["inflight_joins"] += 1
+            self._add_metric(telemetry, "http_inflight_joins")
+
+        started = asyncio.get_running_loop().time()
+        try:
+            result = await asyncio.shield(task)
+            self._add_metric(
+                telemetry, "http_wait_ms",
+                round((asyncio.get_running_loop().time() - started) * 1000, 2),
+            )
+            if owner:
+                self._add_metric(telemetry, "http_network_requests")
+            if result.error:
+                self._add_metric(telemetry, "http_errors")
+            return result
+        finally:
+            if task.done() and self._inflight.get(url) is task:
+                self._inflight.pop(url, None)
 
     async def _get_uncached(self, url: str) -> FetchResult:
         try:
@@ -110,7 +180,13 @@ class Fetcher:
                 ctype = resp.headers.get("content-type", "").lower()
                 if resp.status_code >= 400 or ("html" not in ctype and "xml" not in ctype):
                     await resp.aclose()
-                    return FetchResult(url, final_url, resp.status_code, None)
+                    error = (
+                        f"http_{resp.status_code}"
+                        if resp.status_code >= 400 else "unsupported_content"
+                    )
+                    return FetchResult(
+                        url, final_url, resp.status_code, None, error=error
+                    )
 
                 chunks: list[bytes] = []
                 size = 0
@@ -127,12 +203,20 @@ class Fetcher:
                 except (LookupError, UnicodeDecodeError):
                     html = raw.decode("utf-8", errors="replace")
                 return FetchResult(url, final_url, resp.status_code, html)
-        except Exception:
-            # Timeouts, bad certs, malformed URLs, exotic transport failures —
-            # a single dead site must never take down the batch.
-            return FetchResult(url, url, 0, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Timeouts, bad certs and transport errors stay observable without
+            # taking down the rest of the batch.
+            return FetchResult(
+                url, url, 0, None, error=type(exc).__name__.lower()
+            )
 
-    async def get_many(self, urls: list[str]) -> list[FetchResult]:
+    async def get_many(
+        self, urls: list[str], telemetry: dict | None = None
+    ) -> list[FetchResult]:
         if not urls:
             return []
-        return list(await asyncio.gather(*(self.get(u) for u in urls)))
+        return list(
+            await asyncio.gather(*(self.get(u, telemetry=telemetry) for u in urls))
+        )

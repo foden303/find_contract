@@ -47,6 +47,9 @@ class Result:
     # The scanned site actually mentions the company's city: strong evidence
     address_confirmed: bool = False
     elapsed: float = 0.0
+    # Per-company phase and I/O counters. Persisted with the result so slow
+    # batches can be diagnosed without reproducing them.
+    performance: dict[str, float | int] = field(default_factory=dict)
 
     @property
     def has_contact(self) -> bool:

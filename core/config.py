@@ -10,6 +10,7 @@ DEFAULT_MAX_PAGES = 10
 DEFAULT_TIMEOUT = 12
 DEFAULT_PER_HOST_CONCURRENCY = 4
 DEFAULT_CACHE_TTL = 7 * 24 * 3600  # a week
+DEFAULT_COMPANY_TIMEOUT = 75.0
 
 
 
@@ -152,6 +153,10 @@ class Config:
     max_threads_companies: int = DEFAULT_MAX_THREADS_COMPANIES
     max_pages: int = DEFAULT_MAX_PAGES
     timeout: int = DEFAULT_TIMEOUT
+    # End-to-end budget after a company leaves the input queue. This includes
+    # search, crawl-queue wait and scraping, so pathological sites cannot pin a
+    # worker indefinitely.
+    company_timeout: float = DEFAULT_COMPANY_TIMEOUT
     delay: float = 0.0
     per_host_concurrency: int = DEFAULT_PER_HOST_CONCURRENCY
     top_results: int = 3

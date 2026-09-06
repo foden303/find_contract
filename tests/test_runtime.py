@@ -11,11 +11,11 @@ from ddgs.exceptions import DDGSException
 
 from core.cache import Cache
 from core.config import Config
-from core.fetch import FetchResult
+from core.fetch import Fetcher, FetchResult
 from core.migration import import_legacy
 from core.paths import data_dir, state_dir, upload_dir
 from core.models import Candidate, ContactExtract, Result
-from core.pipeline import _scan_site, _select_candidates
+from core.pipeline import _scan_site, _select_candidates, process_batch, scan_company
 from core.search import SearchClient, SearchError
 from core.settings import effective_settings, public_settings, save_settings
 from core.store import Store
@@ -186,7 +186,7 @@ class IsolatedProfile(unittest.TestCase):
                 self.calls = []
                 self.cancelled = []
 
-            async def get(self, url):
+            async def get(self, url, telemetry=None):
                 self.calls.append(url)
                 if url == "https://acme.com":
                     html = (
@@ -240,6 +240,10 @@ class IsolatedProfile(unittest.TestCase):
                 self.assertEqual(results[0].title, "Recovered")
                 self.assertEqual(client.stats["retries"], 1)
                 self.assertEqual(client.stats["cooldowns"], 1)
+                self.assertEqual(client.stats["adaptive_limit"], 1)
+                for _ in range(11):
+                    await client._record_success()
+                self.assertEqual(client.stats["adaptive_limit"], 2)
             finally:
                 await client.aclose()
                 cache.close()
@@ -258,6 +262,188 @@ class IsolatedProfile(unittest.TestCase):
             self.assertIsNotNone(cache.get_http("https://example49.invalid/"))
         finally:
             cache.close()
+
+    def test_cache_prunes_a_small_final_batch_on_close(self):
+        path = str(Path(self.temporary.name) / "final-batch-cache.db")
+        body = "x" * (16 * 1024)
+        cache = Cache(path, 3600, max_bytes=128 * 1024)
+        for index in range(10):
+            url = f"https://final{index}.invalid/"
+            cache.set_http(url, url, 200, body)
+        cache.close()
+
+        reopened = Cache(path, 3600, max_bytes=128 * 1024)
+        try:
+            self.assertIsNone(reopened.get_http("https://final0.invalid/"))
+            self.assertIsNotNone(reopened.get_http("https://final9.invalid/"))
+        finally:
+            reopened.close()
+    def test_inflight_search_and_http_requests_are_shared(self):
+        async def scenario():
+            config = Config(search_provider="ddg")
+            cache = Cache(config.cache_path, config.cache_ttl)
+            client = SearchClient(config, cache)
+
+            async def backend(*args):
+                await asyncio.sleep(0.02)
+                return [{"href": "https://shared.example", "title": "Shared"}]
+
+            try:
+                with patch.object(
+                    client, "_run_backend", AsyncMock(side_effect=backend)
+                ) as run_backend:
+                    first, second = await asyncio.gather(
+                        client.search("Shared query"),
+                        client.search("Shared query"),
+                    )
+                self.assertEqual(run_backend.await_count, 1)
+                self.assertEqual(client.stats["inflight_joins"], 1)
+                self.assertIsNot(first[0], second[0])
+
+                async with Fetcher(config, cache) as fetcher:
+                    async def fetch(url):
+                        await asyncio.sleep(0.02)
+                        return FetchResult(url, url, 200, "<p>shared</p>")
+
+                    with patch.object(
+                        fetcher, "_get_uncached", AsyncMock(side_effect=fetch)
+                    ) as get_uncached:
+                        pages = await asyncio.gather(
+                            fetcher.get("https://shared-page.example"),
+                            fetcher.get("https://shared-page.example"),
+                        )
+                    self.assertEqual(get_uncached.await_count, 1)
+                    self.assertEqual(fetcher.stats["inflight_joins"], 1)
+                    self.assertTrue(all(page.ok for page in pages))
+            finally:
+                await client.aclose()
+                cache.close()
+
+        asyncio.run(scenario())
+
+    def test_domain_circuit_stops_repeated_failed_requests(self):
+        async def scenario():
+            config = Config(search_provider="ddg", use_cache=False)
+            cache = Cache(config.cache_path, config.cache_ttl, enabled=False)
+            async with Fetcher(config, cache) as fetcher:
+                failure = AsyncMock(
+                    side_effect=lambda url: FetchResult(
+                        url, url, 503, None, error="http_503"
+                    )
+                )
+                with patch.object(fetcher, "_get_uncached", failure):
+                    await fetcher.get("https://dead.example/one")
+                    await fetcher.get("https://dead.example/two")
+                    skipped = await fetcher.get("https://dead.example/three")
+                self.assertEqual(failure.await_count, 2)
+                self.assertEqual(skipped.error, "circuit_open")
+                self.assertEqual(fetcher.stats["circuits_opened"], 1)
+            cache.close()
+
+        asyncio.run(scenario())
+
+    def test_pipeline_overlaps_search_and_crawl_with_one_company_worker(self):
+        async def scenario():
+            second_search_started = asyncio.Event()
+
+            class Search:
+                concurrency = 1
+
+                def __init__(self, *args):
+                    pass
+
+                async def search_many(self, queries, **kwargs):
+                    company = queries[0]
+                    slug = "second-company" if "Second" in company else "first-company"
+                    if "Second" in company:
+                        second_search_started.set()
+                    return [Candidate(
+                        url=f"https://{slug}.example",
+                        title=company,
+                        snippet=f"{company} official website",
+                    )]
+
+                async def aclose(self):
+                    pass
+
+            class PipelineFetcher:
+                def __init__(self, config, cache):
+                    self.cache = cache
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    pass
+
+                async def get(self, url, telemetry=None):
+                    if "first-company" in url:
+                        await asyncio.wait_for(
+                            second_search_started.wait(), timeout=0.3
+                        )
+                    return FetchResult(
+                        url, url, 200,
+                        '<a href="mailto:sales@example.com">Mail</a>'
+                        " +1 202-555-0123",
+                    )
+
+            config = Config(
+                max_threads_companies=1,
+                top_results=1,
+                min_score=0,
+                company_timeout=1,
+                guess_emails=False,
+            )
+            cache = Cache(config.cache_path, config.cache_ttl)
+            try:
+                with (
+                    patch("core.pipeline.SearchClient", Search),
+                    patch("core.pipeline.Fetcher", PipelineFetcher),
+                ):
+                    results = await asyncio.wait_for(
+                        process_batch([
+                            ("First Company", None, []),
+                            ("Second Company", None, []),
+                        ], config, cache=cache),
+                        timeout=0.8,
+                    )
+                self.assertEqual([r.company for r in results], [
+                    "First Company", "Second Company",
+                ])
+                self.assertTrue(second_search_started.is_set())
+                for result in results:
+                    self.assertIn("search_ms", result.performance)
+                    self.assertIn("crawl_queue_ms", result.performance)
+                    self.assertIn("crawl_ms", result.performance)
+                    self.assertIn("total_ms", result.performance)
+            finally:
+                cache.close()
+
+        asyncio.run(scenario())
+
+    def test_company_deadline_returns_an_observable_partial_result(self):
+        class SlowFetcher:
+            cache = None
+
+            async def get(self, url, telemetry=None):
+                await asyncio.sleep(1)
+                return FetchResult(url, url, 200, "<p>late</p>")
+
+        class UnusedSearch:
+            pass
+
+        async def scenario():
+            result = await scan_company(
+                "slow.com",
+                Config(company_timeout=0.1, guess_emails=False),
+                SlowFetcher(),
+                UnusedSearch(),
+            )
+            self.assertEqual(result.performance["timed_out"], 1)
+            self.assertLess(result.elapsed, 0.4)
+            self.assertTrue(any("partial result retained" in n for n in result.notes))
+
+        asyncio.run(scenario())
 
     def test_desktop_auth_origin_guard_and_restart_history(self):
         from fastapi.testclient import TestClient

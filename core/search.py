@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import queue
 import random
+import time
 
 import httpx
 from ddgs.ddgs import DDGS
@@ -58,13 +59,17 @@ class SearchClient:
             )
 
         self.concurrency = SEARCH_CONCURRENCY[self.provider]
-        self._sem = asyncio.Semaphore(self.concurrency)
+        self._adaptive_limit = self.concurrency
+        self._active_requests = 0
+        self._limit_condition = asyncio.Condition()
         self._http: httpx.AsyncClient | None = None
-        self._cooldown_lock = asyncio.Lock()
         self._cooldown_until = 0.0
         self._throttle_streak = 0
+        self._success_streak = 0
+        self._inflight: dict[str, asyncio.Task] = {}
         self.stats = {
             "requests": 0, "cache_hits": 0, "retries": 0, "cooldowns": 0,
+            "inflight_joins": 0, "adaptive_limit": self._adaptive_limit,
         }
 
         # DDGS is synchronous, so it gets a bounded pool driven from threads.
@@ -105,12 +110,25 @@ class SearchClient:
         finally:
             self._pool.put(client)
 
-    async def _wait_for_cooldown(self) -> None:
+    @staticmethod
+    def _add_metric(metrics: dict | None, key: str, value: float | int = 1) -> None:
+        if metrics is not None:
+            metrics[key] = metrics.get(key, 0) + value
+
+    async def _wait_for_cooldown(self, metrics: dict | None = None) -> None:
+        started = time.perf_counter()
+        waited = False
         while True:
             wait = self._cooldown_until - asyncio.get_running_loop().time()
             if wait <= 0:
-                return
+                break
+            waited = True
             await asyncio.sleep(wait)
+        if waited:
+            self._add_metric(
+                metrics, "search_cooldown_ms",
+                round((time.perf_counter() - started) * 1000, 2),
+            )
 
     def _looks_throttled(self, exc: Exception) -> bool:
         if self.provider == "ddg" and isinstance(exc, DDGSException):
@@ -124,30 +142,74 @@ class SearchClient:
 
     async def _apply_cooldown(self, attempt: int) -> None:
         delay = min(MAX_PROVIDER_COOLDOWN, 1.5 * (2**attempt) + random.random())
-        async with self._cooldown_lock:
+        async with self._limit_condition:
             self._throttle_streak = min(self._throttle_streak + 1, 5)
+            self._success_streak = 0
             delay = min(MAX_PROVIDER_COOLDOWN, delay * self._throttle_streak)
             self._cooldown_until = max(
                 self._cooldown_until, asyncio.get_running_loop().time() + delay
             )
+            # AIMD: halve pressure immediately, then recover one slot after a
+            # sustained run of successes.
+            self._adaptive_limit = max(1, self._adaptive_limit // 2)
+            self.stats["adaptive_limit"] = self._adaptive_limit
             self.stats["cooldowns"] += 1
+            self._limit_condition.notify_all()
 
     async def _record_success(self) -> None:
-        async with self._cooldown_lock:
+        async with self._limit_condition:
             self._throttle_streak = max(0, self._throttle_streak - 1)
+            self._success_streak += 1
+            if self._success_streak >= 12 and self._adaptive_limit < self.concurrency:
+                self._adaptive_limit += 1
+                self._success_streak = 0
+                self.stats["adaptive_limit"] = self._adaptive_limit
+                self._limit_condition.notify_all()
+
+    async def _acquire_backend_slot(self, metrics: dict | None = None) -> None:
+        started = time.perf_counter()
+        while True:
+            await self._wait_for_cooldown(metrics)
+            async with self._limit_condition:
+                if (
+                    self._cooldown_until <= asyncio.get_running_loop().time()
+                    and self._active_requests < self._adaptive_limit
+                ):
+                    self._active_requests += 1
+                    self._add_metric(
+                        metrics, "search_queue_ms",
+                        round((time.perf_counter() - started) * 1000, 2),
+                    )
+                    return
+                cooldown_wait = (
+                    self._cooldown_until - asyncio.get_running_loop().time()
+                )
+                if cooldown_wait > 0:
+                    try:
+                        await asyncio.wait_for(
+                            self._limit_condition.wait(), timeout=cooldown_wait
+                        )
+                    except TimeoutError:
+                        pass
+                else:
+                    await self._limit_condition.wait()
+
+    async def _release_backend_slot(self) -> None:
+        async with self._limit_condition:
+            self._active_requests -= 1
+            self._limit_condition.notify_all()
 
     async def _run_limited_backend(
-        self, query: str, limit: int, region: str | None
+        self, query: str, limit: int, region: str | None,
+        metrics: dict | None = None,
     ) -> list[dict]:
-        while True:
-            await self._wait_for_cooldown()
-            async with self._sem:
-                # Do not occupy a scarce permit if another request established
-                # a cooldown between our first check and permit acquisition.
-                if self._cooldown_until > asyncio.get_running_loop().time():
-                    continue
-                self.stats["requests"] += 1
-                return await self._run_backend(query, limit, region)
+        await self._acquire_backend_slot(metrics)
+        try:
+            self.stats["requests"] += 1
+            self._add_metric(metrics, "search_requests")
+            return await self._run_backend(query, limit, region)
+        finally:
+            await self._release_backend_slot()
 
     async def _searxng(self, query: str, limit: int, region: str | None) -> list[dict]:
         """Self-hosted SearXNG. Aggregates several engines; no key, no quota."""
@@ -214,36 +276,30 @@ class SearchClient:
         return await self._serper(query, limit, region)
 
     async def aclose(self) -> None:
+        pending = list(self._inflight.values())
+        self._inflight.clear()
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         if self._http is not None:
             await self._http.aclose()
             self._http = None
-
-    async def search(
-        self, query: str, limit: int = 10, country: str | None = None
-    ) -> list[Candidate]:
-        region = ddg_region(country)
-        # The cache format includes the controlled backend sequence. Older
-        # "ddg" entries came from auto/meta search and must not leak into it.
-        backend = "duckduckgo-bing" if self.provider == "ddg" else self.provider
-        key = hashlib.sha1(
-            f"{SEARCH_CACHE_VERSION}|{backend}|{query}|{limit}|{region}".encode()
-        ).hexdigest()
-
-        cached = self.cache.get_search(key)
-        if cached is not None:
-            self.stats["cache_hits"] += 1
-            return [Candidate(**c) for c in cached]
-
+    async def _search_uncached(
+        self, key: str, query: str, limit: int, region: str | None
+    ) -> tuple[list[dict], dict]:
+        metrics: dict[str, float | int] = {}
         rows: list[dict] = []
         for attempt in range(MAX_ATTEMPTS):
-            await self._wait_for_cooldown()
+            await self._wait_for_cooldown(metrics)
             try:
-                rows = await self._run_limited_backend(query, limit, region)
+                rows = await self._run_limited_backend(
+                    query, limit, region, metrics
+                )
                 await self._record_success()
                 break
             except SearchError:
-                # Misconfiguration: retrying cannot help, and swallowing it
-                # would look exactly like "this company has no web presence".
                 raise
             except Exception as exc:
                 if attempt == MAX_ATTEMPTS - 1:
@@ -252,13 +308,14 @@ class SearchClient:
                         "Check your network and search settings, or try again later."
                     ) from exc
                 self.stats["retries"] += 1
+                self._add_metric(metrics, "search_retries")
                 if self._looks_throttled(exc):
-                    # This is provider-wide pressure. Release the request permit
-                    # and pause every query instead of sleeping inside the slot.
                     await self._apply_cooldown(attempt)
-                    await self._wait_for_cooldown()
+                    await self._wait_for_cooldown(metrics)
                 else:
-                    await asyncio.sleep(1.5 * (2**attempt) + random.random())
+                    delay = 1.5 * (2**attempt) + random.random()
+                    await asyncio.sleep(delay)
+                    self._add_metric(metrics, "search_backoff_ms", round(delay * 1000, 2))
 
         candidates = []
         seen = set()
@@ -282,11 +339,57 @@ class SearchClient:
                 )
             )
 
-        self.cache.set_search(key, [c.__dict__ for c in candidates])
-        return candidates
+        payload = [c.__dict__ for c in candidates]
+        self.cache.set_search(key, payload)
+        return payload, metrics
+
+    async def search(
+        self, query: str, limit: int = 10, country: str | None = None,
+        telemetry: dict | None = None,
+    ) -> list[Candidate]:
+        self._add_metric(telemetry, "logical_queries")
+        region = ddg_region(country)
+        backend = "duckduckgo-bing" if self.provider == "ddg" else self.provider
+        key = hashlib.sha1(
+            f"{SEARCH_CACHE_VERSION}|{backend}|{query}|{limit}|{region}".encode()
+        ).hexdigest()
+
+        cached = self.cache.get_search(key)
+        if cached is not None:
+            self.stats["cache_hits"] += 1
+            self._add_metric(telemetry, "search_cache_hits")
+            return [Candidate(**c) for c in cached]
+
+        task = self._inflight.get(key)
+        owner = task is None
+        if owner:
+            task = asyncio.create_task(
+                self._search_uncached(key, query, limit, region)
+            )
+            self._inflight[key] = task
+        else:
+            self.stats["inflight_joins"] += 1
+            self._add_metric(telemetry, "search_inflight_joins")
+
+        started = time.perf_counter()
+        try:
+            payload, metrics = await asyncio.shield(task)
+            if owner and telemetry is not None:
+                for name, value in metrics.items():
+                    self._add_metric(telemetry, name, value)
+            elif not owner:
+                self._add_metric(
+                    telemetry, "search_inflight_wait_ms",
+                    round((time.perf_counter() - started) * 1000, 2),
+                )
+            return [Candidate(**c) for c in payload]
+        finally:
+            if task.done() and self._inflight.get(key) is task:
+                self._inflight.pop(key, None)
 
     async def search_many(
-        self, queries: list[str], limit: int = 10, country: str | None = None
+        self, queries: list[str], limit: int = 10, country: str | None = None,
+        telemetry: dict | None = None,
     ) -> list[Candidate]:
         """Search with bounded per-company fanout and merge first sightings."""
         if not queries:
@@ -305,7 +408,8 @@ class SearchClient:
                     next_index += 1
                 try:
                     batches[index] = await self.search(
-                        queries[index], limit=limit, country=country
+                        queries[index], limit=limit, country=country,
+                        telemetry=telemetry,
                     )
                 except asyncio.CancelledError:
                     raise
