@@ -11,6 +11,7 @@ import random
 
 import httpx
 from ddgs.ddgs import DDGS
+from ddgs.exceptions import DDGSException
 
 from core.cache import Cache
 from core.config import SEARCH_CONCURRENCY, SKIP_HOSTS, USER_AGENT, Config
@@ -18,6 +19,10 @@ from core.models import Candidate
 from core.utils import host_of, normalize_url, region_for_country
 
 MAX_ATTEMPTS = 3
+SEARCH_CACHE_VERSION = 2
+PER_COMPANY_SEARCH_CONCURRENCY = 2
+MAX_PROVIDER_COOLDOWN = 30.0
+FREE_SEARCH_BACKENDS = ("duckduckgo", "bing")
 
 # ISO region -> DuckDuckGo region code (DDG uses `uk` rather than `gb`)
 _DDG_REGION_OVERRIDE = {"GB": "uk"}
@@ -55,8 +60,14 @@ class SearchClient:
         self.concurrency = SEARCH_CONCURRENCY[self.provider]
         self._sem = asyncio.Semaphore(self.concurrency)
         self._http: httpx.AsyncClient | None = None
+        self._cooldown_lock = asyncio.Lock()
+        self._cooldown_until = 0.0
+        self._throttle_streak = 0
+        self.stats = {
+            "requests": 0, "cache_hits": 0, "retries": 0, "cooldowns": 0,
+        }
 
-        # DDGS is synchronous, so it gets a pool of clients driven from threads.
+        # DDGS is synchronous, so it gets a bounded pool driven from threads.
         self._pool: queue.Queue = queue.Queue()
         if self.provider == "ddg":
             for _ in range(self.concurrency):
@@ -81,9 +92,62 @@ class SearchClient:
             kwargs = {"max_results": limit}
             if region:
                 kwargs["region"] = region
-            return client.text(query, **kwargs) or []
+            last_error: Exception | None = None
+            for backend in FREE_SEARCH_BACKENDS:
+                try:
+                    rows = client.text(query, backend=backend, **kwargs) or []
+                except DDGSException as exc:
+                    last_error = exc
+                    continue
+                if rows:
+                    return rows
+            raise last_error or DDGSException("No results found.")
         finally:
             self._pool.put(client)
+
+    async def _wait_for_cooldown(self) -> None:
+        while True:
+            wait = self._cooldown_until - asyncio.get_running_loop().time()
+            if wait <= 0:
+                return
+            await asyncio.sleep(wait)
+
+    def _looks_throttled(self, exc: Exception) -> bool:
+        if self.provider == "ddg" and isinstance(exc, DDGSException):
+            # The HTML backend maps non-200 responses, including 429, to an
+            # empty result and DDGSException. Treat it as shared pressure.
+            return True
+        return (
+            isinstance(exc, httpx.HTTPStatusError)
+            and exc.response.status_code in (429, 503)
+        )
+
+    async def _apply_cooldown(self, attempt: int) -> None:
+        delay = min(MAX_PROVIDER_COOLDOWN, 1.5 * (2**attempt) + random.random())
+        async with self._cooldown_lock:
+            self._throttle_streak = min(self._throttle_streak + 1, 5)
+            delay = min(MAX_PROVIDER_COOLDOWN, delay * self._throttle_streak)
+            self._cooldown_until = max(
+                self._cooldown_until, asyncio.get_running_loop().time() + delay
+            )
+            self.stats["cooldowns"] += 1
+
+    async def _record_success(self) -> None:
+        async with self._cooldown_lock:
+            self._throttle_streak = max(0, self._throttle_streak - 1)
+
+    async def _run_limited_backend(
+        self, query: str, limit: int, region: str | None
+    ) -> list[dict]:
+        while True:
+            await self._wait_for_cooldown()
+            async with self._sem:
+                # Do not occupy a scarce permit if another request established
+                # a cooldown between our first check and permit acquisition.
+                if self._cooldown_until > asyncio.get_running_loop().time():
+                    continue
+                self.stats["requests"] += 1
+                return await self._run_backend(query, limit, region)
 
     async def _searxng(self, query: str, limit: int, region: str | None) -> list[dict]:
         """Self-hosted SearXNG. Aggregates several engines; no key, no quota."""
@@ -158,33 +222,42 @@ class SearchClient:
         self, query: str, limit: int = 10, country: str | None = None
     ) -> list[Candidate]:
         region = ddg_region(country)
-        # The provider is part of the key: results differ between backends, so
-        # switching provider must not serve the previous one's cached answers.
+        # The cache format includes the controlled backend sequence. Older
+        # "ddg" entries came from auto/meta search and must not leak into it.
+        backend = "duckduckgo-bing" if self.provider == "ddg" else self.provider
         key = hashlib.sha1(
-            f"{self.provider}|{query}|{limit}|{region}".encode()
+            f"{SEARCH_CACHE_VERSION}|{backend}|{query}|{limit}|{region}".encode()
         ).hexdigest()
 
         cached = self.cache.get_search(key)
         if cached is not None:
+            self.stats["cache_hits"] += 1
             return [Candidate(**c) for c in cached]
 
         rows: list[dict] = []
-        async with self._sem:
-            for attempt in range(MAX_ATTEMPTS):
-                try:
-                    rows = await self._run_backend(query, limit, region)
-                    break
-                except SearchError:
-                    # Misconfiguration: retrying cannot help, and swallowing it
-                    # would look exactly like "this company has no web presence".
-                    raise
-                except Exception as exc:
-                    if attempt == MAX_ATTEMPTS - 1:
-                        raise SearchError(
-                            f"{self.provider} search failed after {MAX_ATTEMPTS} attempts. "
-                            "Check your network and search settings, or try again later."
-                        ) from exc
-                    # Exponential backoff with jitter; engines rate-limit bursts
+        for attempt in range(MAX_ATTEMPTS):
+            await self._wait_for_cooldown()
+            try:
+                rows = await self._run_limited_backend(query, limit, region)
+                await self._record_success()
+                break
+            except SearchError:
+                # Misconfiguration: retrying cannot help, and swallowing it
+                # would look exactly like "this company has no web presence".
+                raise
+            except Exception as exc:
+                if attempt == MAX_ATTEMPTS - 1:
+                    raise SearchError(
+                        f"{self.provider} search failed after {MAX_ATTEMPTS} attempts. "
+                        "Check your network and search settings, or try again later."
+                    ) from exc
+                self.stats["retries"] += 1
+                if self._looks_throttled(exc):
+                    # This is provider-wide pressure. Release the request permit
+                    # and pause every query instead of sleeping inside the slot.
+                    await self._apply_cooldown(attempt)
+                    await self._wait_for_cooldown()
+                else:
                     await asyncio.sleep(1.5 * (2**attempt) + random.random())
 
         candidates = []
@@ -215,17 +288,47 @@ class SearchClient:
     async def search_many(
         self, queries: list[str], limit: int = 10, country: str | None = None
     ) -> list[Candidate]:
-        """Run every query concurrently and merge, keeping the first sighting."""
-        batches = await asyncio.gather(
-            *(self.search(q, limit=limit, country=country) for q in queries),
-            return_exceptions=True,
-        )
+        """Search with bounded per-company fanout and merge first sightings."""
+        if not queries:
+            return []
+        batches: list[list[Candidate] | BaseException | None] = [None] * len(queries)
+        next_index = 0
+        index_lock = asyncio.Lock()
+
+        async def worker() -> None:
+            nonlocal next_index
+            while True:
+                async with index_lock:
+                    if next_index >= len(queries):
+                        return
+                    index = next_index
+                    next_index += 1
+                try:
+                    batches[index] = await self.search(
+                        queries[index], limit=limit, country=country
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    batches[index] = exc
+
+        workers = [
+            asyncio.create_task(worker())
+            for _ in range(min(PER_COMPANY_SEARCH_CONCURRENCY, len(queries)))
+        ]
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            for task in workers:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
         merged: dict[str, Candidate] = {}
         for batch in batches:
             if isinstance(batch, SearchError):
-                # A broken backend must not be reduced to "found nothing"
                 raise batch
-            if isinstance(batch, BaseException):
+            if isinstance(batch, BaseException) or batch is None:
                 continue
             for cand in batch:
                 if cand.url not in merged:

@@ -44,6 +44,10 @@ OFF_DOMAIN_TRUST = 45.0
 # before we trust it as another of that company's own sites.
 MERGE_NAME_FLOOR = 45.0
 
+# Stop after the two strongest queries when they already identify a plausible
+# first-party site. Lower scores still receive the complete fallback query set.
+SEARCH_EXPANSION_SCORE = 70.0
+
 
 # One company's contact page lists a handful of numbers. Anything past this is
 # a directory of other people's companies.
@@ -66,6 +70,10 @@ def _is_listing_page(found: ContactExtract) -> bool:
         len(found.phones) > MAX_PHONES_PER_PAGE
         or len(found.emails) > MAX_EMAILS_PER_PAGE
     )
+
+def _has_complete_contact(found: ContactExtract) -> bool:
+    priority, _ = prioritize_emails(sorted(found.emails))
+    return bool(priority and found.phones)
 
 
 def _filter_emails(
@@ -122,11 +130,29 @@ async def _select_candidates(
     locality: str = "",
 ) -> list[Candidate]:
     queries = build_company_queries(query, country, products, locality)
-    found = await search.search_many(queries, limit=8, country=country)
-    if not found:
-        return []
+    primary = queries[:2]
+    found = await search.search_many(primary, limit=8, country=country)
+    ranked = rank_candidates(found, query, country, products, locality) if found else []
 
-    return rank_candidates(found, query, country, products, locality)
+    sufficient_score = max(config.min_score, SEARCH_EXPANSION_SCORE)
+    if (
+        ranked
+        and ranked[0].score >= sufficient_score
+        and not ranked[0].is_directory
+        and not ranked[0].is_snippet_only
+    ):
+        return ranked
+
+    fallback = queries[2:]
+    if not fallback:
+        return ranked
+    additional = await search.search_many(fallback, limit=8, country=country)
+    merged = {candidate.url: candidate for candidate in found}
+    for candidate in additional:
+        merged.setdefault(candidate.url, candidate)
+    return rank_candidates(
+        list(merged.values()), query, country, products, locality
+    )
 
 
 async def _scan_site(
@@ -162,27 +188,50 @@ async def _scan_site(
         res.address_confirmed = True
         res.match_reason.append("address confirmed on site")
 
-    if config.early_exit:
-        priority, _ = prioritize_emails(sorted(collected.emails))
-        if priority and collected.phones:
-            res.notes.append("early exit: contact found on homepage")
-            return
+    if config.early_exit and _has_complete_contact(collected):
+        res.notes.append("early exit: contact found on homepage")
+        return
 
     if not pages:
         return
 
-    fetched = await fetcher.get_many(pages)
-    for page in fetched:
-        if not page.ok:
-            continue
-        found = extract_contacts(page.html, page.final_url, region)
-        if _is_listing_page(found):
-            # A "top Indian importers" page yields dozens of numbers, none of
-            # which belong to the company we asked about.
-            res.notes.append(f"skipped listing page: {page.final_url}")
-            continue
-        collected.merge(found)
-        res.pages_scanned.append(page.final_url)
+    # Strong links are first. Fetch two at a time so a successful contact page
+    # prevents the remaining weak/privacy/guessed paths from consuming network.
+    wave_size = 2
+    for offset in range(0, len(pages), wave_size):
+        pending = {
+            asyncio.create_task(fetcher.get(url))
+            for url in pages[offset : offset + wave_size]
+        }
+        try:
+            while pending:
+                completed, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in completed:
+                    page = await task
+                    if not page.ok:
+                        continue
+                    found = extract_contacts(page.html, page.final_url, region)
+                    if _is_listing_page(found):
+                        # A directory page can expose dozens of contacts that
+                        # belong to other companies.
+                        res.notes.append(f"skipped listing page: {page.final_url}")
+                        continue
+                    collected.merge(found)
+                    res.pages_scanned.append(page.final_url)
+                    if config.early_exit and _has_complete_contact(collected):
+                        res.notes.append("early exit: contact found on contact page")
+                        for remaining in pending:
+                            remaining.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        return
+        finally:
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
 
 async def scan_company(

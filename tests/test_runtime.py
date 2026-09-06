@@ -7,10 +7,15 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from ddgs.exceptions import DDGSException
+
 from core.cache import Cache
 from core.config import Config
+from core.fetch import FetchResult
 from core.migration import import_legacy
 from core.paths import data_dir, state_dir, upload_dir
+from core.models import Candidate, ContactExtract, Result
+from core.pipeline import _scan_site, _select_candidates
 from core.search import SearchClient, SearchError
 from core.settings import effective_settings, public_settings, save_settings
 from core.store import Store
@@ -98,6 +103,161 @@ class IsolatedProfile(unittest.TestCase):
                 await client.aclose()
                 cache.close()
         asyncio.run(scenario())
+
+    def test_duckduckgo_backend_and_per_company_search_bound(self):
+        async def scenario():
+            config = Config(search_provider="ddg")
+            cache = Cache(config.cache_path, config.cache_ttl)
+            client = SearchClient(config, cache)
+            calls = []
+
+            class Backend:
+                def text(self, query, **kwargs):
+                    calls.append((query, kwargs))
+                    return (
+                        [{"href": "https://example.com", "title": "Acme"}]
+                        if kwargs["backend"] == "bing" else []
+                    )
+
+            while not client._pool.empty():
+                client._pool.get()
+            client._pool.put(Backend())
+            rows = client._blocking_search("Acme", 8, "us-en")
+            self.assertEqual(rows[0]["title"], "Acme")
+            self.assertEqual(
+                [kwargs["backend"] for _, kwargs in calls],
+                ["duckduckgo", "bing"],
+            )
+
+            active = maximum = 0
+
+            async def fake_search(query, **kwargs):
+                nonlocal active, maximum
+                active += 1
+                maximum = max(maximum, active)
+                await asyncio.sleep(0.01)
+                active -= 1
+                return []
+
+            try:
+                with patch.object(client, "search", side_effect=fake_search):
+                    await client.search_many(["a", "b", "c", "d", "e"])
+                self.assertEqual(maximum, 2)
+            finally:
+                await client.aclose()
+                cache.close()
+
+        asyncio.run(scenario())
+
+    def test_search_expands_only_when_primary_candidates_are_weak(self):
+        class Search:
+            def __init__(self, candidate):
+                self.candidate = candidate
+                self.calls = []
+
+            async def search_many(self, queries, **kwargs):
+                self.calls.append(list(queries))
+                return [self.candidate] if len(self.calls) == 1 else []
+
+        async def scenario():
+            strong = Search(Candidate(
+                url="https://acme.com", title="Acme Ltd",
+                snippet="Acme Ltd Vietnam cinnamon sales@acme.com",
+            ))
+            await _select_candidates(
+                "Acme Ltd", "Vietnam", ["cinnamon"], Config(), strong
+            )
+            self.assertEqual([len(batch) for batch in strong.calls], [2])
+
+            weak = Search(Candidate(
+                url="https://directory.invalid/acme", title="Business directory",
+                snippet="Acme listing", is_directory=True,
+            ))
+            await _select_candidates(
+                "Acme Ltd", "Vietnam", ["cinnamon"], Config(), weak
+            )
+            self.assertEqual([len(batch) for batch in weak.calls], [2, 2])
+
+        asyncio.run(scenario())
+
+    def test_contact_crawl_cancels_remaining_pages_after_complete_contact(self):
+        class Fetcher:
+            def __init__(self):
+                self.calls = []
+                self.cancelled = []
+
+            async def get(self, url):
+                self.calls.append(url)
+                if url == "https://acme.com":
+                    html = (
+                        '<a href="/contact">Contact</a>'
+                        '<a href="/about">About</a>'
+                        '<a href="/privacy">Privacy</a>'
+                    )
+                    return FetchResult(url, url, 200, html)
+                if url.endswith("/contact"):
+                    await asyncio.sleep(0.001)
+                    html = '<a href="mailto:sales@acme.com">Email</a> +1 202-555-0123'
+                    return FetchResult(url, url, 200, html)
+                try:
+                    await asyncio.sleep(1)
+                    return FetchResult(url, url, 200, "<p>About</p>")
+                except asyncio.CancelledError:
+                    self.cancelled.append(url)
+                    raise
+
+        async def scenario():
+            fetcher = Fetcher()
+            collected = ContactExtract()
+            result = Result(query="Acme Ltd", company="Acme Ltd", website="https://acme.com")
+            await _scan_site(
+                Candidate(url="https://acme.com", title="Acme Ltd", score=80),
+                Config(max_pages=5, early_exit=True), fetcher, "US",
+                collected, result,
+            )
+            self.assertIn("sales@acme.com", collected.emails)
+            self.assertTrue(collected.phones)
+            self.assertIn("https://acme.com/about", fetcher.cancelled)
+            self.assertNotIn("https://acme.com/privacy", fetcher.calls)
+
+        asyncio.run(scenario())
+
+    def test_provider_cooldown_retries_without_caching_failure(self):
+        async def scenario():
+            config = Config(search_provider="ddg")
+            cache = Cache(config.cache_path, config.cache_ttl)
+            client = SearchClient(config, cache)
+            recovered = [{"href": "https://example.com", "title": "Recovered"}]
+            try:
+                with (
+                    patch.object(
+                        client, "_run_backend",
+                        AsyncMock(side_effect=[DDGSException("rate limited"), recovered]),
+                    ),
+                    patch("core.search.MAX_PROVIDER_COOLDOWN", 0.01),
+                ):
+                    results = await client.search("Cooldown fixture")
+                self.assertEqual(results[0].title, "Recovered")
+                self.assertEqual(client.stats["retries"], 1)
+                self.assertEqual(client.stats["cooldowns"], 1)
+            finally:
+                await client.aclose()
+                cache.close()
+
+        asyncio.run(scenario())
+
+    def test_cache_evicts_old_http_bodies_at_size_limit(self):
+        path = str(Path(self.temporary.name) / "bounded-cache.db")
+        cache = Cache(path, 3600, max_bytes=128 * 1024)
+        try:
+            body = "x" * (16 * 1024)
+            for index in range(50):
+                url = f"https://example{index}.invalid/"
+                cache.set_http(url, url, 200, body)
+            self.assertIsNone(cache.get_http("https://example0.invalid/"))
+            self.assertIsNotNone(cache.get_http("https://example49.invalid/"))
+        finally:
+            cache.close()
 
     def test_desktop_auth_origin_guard_and_restart_history(self):
         from fastapi.testclient import TestClient

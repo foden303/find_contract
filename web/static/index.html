@@ -588,7 +588,8 @@ $('btn-theme').onclick = () => {
 
 const state = { fileId: null, headers: [], sheets: [], runId: null, es: null,
                 results: [], sortKey: 'confidence', sortDir: -1, startedAt: 0, page: 1,
-                timer: null, sample: [], fileMeta: null, plan: null, mapping: {},
+                timer: null, resultRenderTimer: null, hitCount: 0, emailCount: 0,
+                sample: [], fileMeta: null, plan: null, mapping: {},
                 settings: null, settingsBusy: false, settingsDirty: false, keyTouched: false,
                 settingsMessage: null, running: false, starting: false };
 
@@ -953,11 +954,20 @@ $('btn-run').onclick = async () => {
 
   state.runId = data.run_id;
   state.results = [];
+  state.hitCount = 0;
+  state.emailCount = 0;
+  if (state.resultRenderTimer !== null) clearTimeout(state.resultRenderTimer);
+  state.resultRenderTimer = null;
   state.page = 1;
   state.startedAt = Date.now();
   $('s-run').hidden = false;
   $('s-history').hidden = true;
   $('results').tBodies[0].innerHTML = '';
+  $('st-done').textContent = '0';
+  $('st-hit').textContent = '0';
+  $('st-mail').textContent = '0';
+  $('st-time').textContent = '0s';
+  $('bar').style.width = '0%';
   $('run-status').textContent = t('run.running');
   $('btn-run').disabled = true;
   $('btn-cancel').disabled = false;
@@ -977,17 +987,32 @@ $('btn-run').onclick = async () => {
   };
 };
 
+function flushResultsRender() {
+  if (state.resultRenderTimer !== null) clearTimeout(state.resultRenderTimer);
+  state.resultRenderTimer = null;
+  renderResults();
+}
+
+function scheduleResultsRender() {
+  if (state.resultRenderTimer !== null) return;
+  // Coalesce bursts from concurrent workers instead of sorting and rebuilding
+  // the table once for every result event.
+  state.resultRenderTimer = setTimeout(flushResultsRender, 150);
+}
+
 function handleEvent(ev) {
   if (ev.type === 'result') {
     state.results.push(ev.result);
     $('st-done').textContent = ev.done;
     $('bar').style.width = (ev.done / ev.total * 100) + '%';
-    $('st-hit').textContent = state.results.filter(hasContact).length;
-    $('st-mail').textContent = state.results.reduce(
-      (n, r) => n + r.priority_emails.length + r.emails.length, 0);
-    renderResults();
+    if (hasContact(ev.result)) state.hitCount++;
+    state.emailCount += ev.result.priority_emails.length + ev.result.emails.length;
+    $('st-hit').textContent = state.hitCount;
+    $('st-mail').textContent = state.emailCount;
+    scheduleResultsRender();
   } else if (ev.type === 'done' || ev.type === 'cancelled' || ev.type === 'error') {
     clearInterval(state.timer);
+    flushResultsRender();
     state.running = false;
     updateRunButton();
     $('btn-cancel').disabled = true;
@@ -1136,16 +1161,20 @@ async function loadRun(id) {
   catch (err) { $('history-error').textContent = err.message; return; }
   if (state.es) state.es.close();
   clearInterval(state.timer);
+  if (state.resultRenderTimer !== null) clearTimeout(state.resultRenderTimer);
+  state.resultRenderTimer = null;
   state.running = ['running', 'pending', 'queued'].includes(data.run.status);
   updateRunButton();
   state.runId = id;
   state.results = data.results;
   state.page = 1;
   $('s-run').hidden = false;
-  $('st-done').textContent = data.results.length;
-  $('st-hit').textContent = data.results.filter(hasContact).length;
-  $('st-mail').textContent = data.results.reduce(
+  state.hitCount = data.results.filter(hasContact).length;
+  state.emailCount = data.results.reduce(
     (n, r) => n + r.priority_emails.length + r.emails.length, 0);
+  $('st-done').textContent = data.results.length;
+  $('st-hit').textContent = state.hitCount;
+  $('st-mail').textContent = state.emailCount;
   $('st-time').textContent = (data.run.elapsed || 0).toFixed(0) + 's';
   $('bar').style.width = '100%';
   $('run-status').textContent = t('run.loaded', { id });

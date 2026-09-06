@@ -151,13 +151,19 @@ The default provider is **DuckDuckGo** and needs no setup. Optional providers:
 
 | Provider | Configuration | Notes |
 |---|---|---|
-| DuckDuckGo | none | free, scraped upstream; may throttle or vary between runs |
+| DuckDuckGo | none | free HTML search with one Bing fallback; public endpoints may throttle |
 | SearXNG | base URL | self-hosted JSON API; upstream engines can still throttle |
 | Brave | API key | usage and billing follow the Brave plan |
 | Serper | API key | usage and billing follow the Serper plan |
 
 Click **Save settings**. Saving does not make a test request. A provider outage
 is reported as an error after retries; it is not cached as “no results.”
+
+DuckDuckGo mode tries the DuckDuckGo HTML backend first, then one explicit Bing
+fallback if DuckDuckGo returns no usable result. It never fans one query out
+through DDGS meta-search. The engine starts with the two strongest queries and
+runs fallback queries only when those results do not identify a high-confidence
+first-party website. Shared cooldowns reduce sustained throttling.
 
 On Windows, saved API keys are protected with the current Windows user's DPAPI
 credentials. API keys are never returned to browser JavaScript, placed in
@@ -208,11 +214,11 @@ cinnamon, cassia, star anise
 | Option | Default | Meaning |
 |---|---:|---|
 | Parallel workers | 8 | companies processed concurrently |
-| Pages per site | 10 | maximum pages fetched from a candidate site |
-| Candidates per company | 3 | search results examined per company |
+| Pages per site | 10 | contact-page ceiling; strongest links are fetched first in small waves |
+| Candidates per company | 3 | maximum candidate websites scanned, best first |
 | Minimum score | 30 | candidates below this score are not scraped |
 | Delay | 0 | minimum delay between requests to one host |
-| Cache | enabled | reuse HTTP/search/MX results |
+| Cache | enabled | reuse HTTP/search/MX results; persistent cache is capped near 512 MiB |
 | Guess emails | enabled | validate common role-address guesses through MX |
 | Merge all candidates | disabled | scan and combine every qualifying site |
 | Company store | enabled | reuse recently completed company results |
